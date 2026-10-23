@@ -1,0 +1,25 @@
+# --- Core bot runtime ---
+discord.py>=2.7
+python-dotenv>=1.0
+numpy>=1.24
+pillow>=10.0
+
+# --- /lookup + /copyr8 Auto-Fit engine (optional but recommended) ---
+# Needed only for those commands. If you skip these, the rest still works;
+# /lookup and /copyr8 Auto-Fit reply with a clear "missing dependency" message.
+librosa>=0.10
+soundfile>=0.12
+requests>=2.31
+pytz
+# /lookup recognition engine (ShazamIO)
+shazamio>=0.8
+# AcoustID fingerprint lookup for /copyr8 auto-fit. Also needs Chromaprint's
+# fpcalc.exe (tools\chromaprint\, PATH, or FPCALC) and ACOUSTID_API_KEY in the
+# local .env -- see RECOGNITION_SETUP.md. Install into the bot's .venv:
+#   .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+pyacoustid>=1.3
+
+# --- /download ---
+# Needs the standalone yt-dlp CLI on PATH (`winget install yt-dlp.yt-dlp`), not
+# a pip module. ffmpeg/ffprobe must also be on PATH for /analyze, /copyr8,
+# /roblox, /shazam (and the /copyr8 spectrogram).
