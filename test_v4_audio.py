@@ -1,6 +1,9 @@
-"""Signal-level V4 regressions: no generated whine, sweeping FX, or mono damage.
+"""Regressions for V4's ADDITIONAL spectral layer, not a replacement macro.
 
-Uses real ffmpeg renders; no Discord, Audacity, or recognition API calls.
+The original macro intentionally contains mono conversion, Tremolo x2 and SC1
+x2. These tests ensure the extra layer preserves supplied modulation and adds
+no new whistles/sweeps or channel changes. ffmpeg runs for real; Audacity/SC1
+and recognition API boundaries are mocked.
 """
 
 import os
@@ -13,10 +16,12 @@ from unittest.mock import patch
 import numpy as np
 import soundfile as sf
 
+import audacity_processor as processor
+from audacity_pipe import parse_macro
 import killa_tools as kt
 
 
-class V4AudioSafetyTests(unittest.TestCase):
+class V4SpectralLayerSafetyTests(unittest.TestCase):
     def test_base_and_export_graphs_have_no_generated_tones_or_sweeping_fx(self):
         graphs = [kt._v4_sculpt_filter_complex(0.0, kt.AUTOFIT_CLIP_THRESHOLD, 10.0)]
         for already_macro in (False, True):
@@ -25,6 +30,8 @@ class V4AudioSafetyTests(unittest.TestCase):
                 kt._apply_v4_base_fx("source.wav", "destination.wav", already_macro=already_macro)
             command = run.call_args.args[0]
             graphs.append(command[command.index("-filter_complex") + 1])
+            if already_macro:
+                self.assertNotIn("acompressor", graphs[-1])
 
         for graph in graphs:
             with self.subTest(graph=graph):
@@ -58,7 +65,89 @@ class V4AudioSafetyTests(unittest.TestCase):
         self.assertIn("atrim=start=0,", graph)
         self.assertNotIn(":end=", graph)
 
-    def test_steady_source_has_no_whine_wobble_or_new_mono_cancellation(self):
+    def test_original_macro_runs_first_then_spectral_layer_probes_and_export(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sr = 48000
+            t = np.arange(sr * 3) / sr
+            source_audio = 0.15 * np.sin(2 * np.pi * 440 * t)
+            source = os.path.join(tmp, "source.wav")
+            output = os.path.join(tmp, "output.mp3")
+            spectrogram = os.path.join(tmp, "spectrogram.png")
+            base = os.path.join(tmp, "autofit_v4_base.wav")
+            sf.write(source, np.column_stack([source_audio, source_audio]), sr, subtype="FLOAT")
+            original_bytes = Path(source).read_bytes()
+            steps = [name for name, _ in parse_macro(processor.BUNDLED_V4_MACRO)]
+            events = []
+            real_base_fx, real_export = kt._apply_v4_base_fx, kt._match_loudness
+
+            def macro(src, dst, progress=None):
+                events.append("macro")
+                # Stand-in for the Windows/Audacity boundary, not an SC1 emulation.
+                # The exact original commands/parameters are locked in macro tests.
+                audio, rate = sf.read(src, always_2d=True)
+                audio[:, 1] *= 0.65 + 0.25 * np.sin(2 * np.pi * 4 * t)
+                sf.write(dst, audio, rate, subtype="FLOAT")
+                return {"steps": steps, "metadata": False}
+
+            def spectral(src, dst, **kwargs):
+                events.append("spectral")
+                return real_base_fx(src, dst, **kwargs)
+
+            def probe(path, windows, progress=None):
+                events.append("probe")
+                return True, [0] * len(windows)
+
+            def export(*args, **kwargs):
+                events.append("export")
+                return real_export(*args, **kwargs)
+
+            with patch.object(kt.acoustid_backend, "validate_setup"), \
+                 patch.object(kt.songrec_backend, "validate_setup"), \
+                 patch.object(kt, "_apply_v4_base_fx", side_effect=spectral) as apply_spectral, \
+                 patch.object(kt, "_probe_sweep", side_effect=probe) as probe_sweep, \
+                 patch.object(kt, "_control_check", return_value=True), \
+                 patch.object(kt, "_match_loudness", side_effect=export) as match_loudness:
+                progress = []
+                result = kt.copyr8_autofit_v4(
+                    source, output, spectrogram, macro_fn=macro, progress=progress.append)
+
+            self.assertEqual(events, ["macro", "spectral", "probe", "export"])
+            self.assertTrue(any("separate V4 spectrogram layer" in line for line in progress))
+            apply_spectral.assert_called_once_with(base, base, already_macro=True)
+            self.assertEqual(probe_sweep.call_args.args[0], base)
+            self.assertEqual(match_loudness.call_args.args[0], base)
+            self.assertTrue(match_loudness.call_args.kwargs["v4_sculpt"])
+            self.assertTrue(result["macro"]["applied"])
+            self.assertEqual(result["macro"]["steps"], steps)
+            self.assertEqual(len(steps), 17)
+            # No EXTRA tremolo overlay: the original macro's own effects stay.
+            self.assertFalse(result["tremolo_applied"])
+            self.assertEqual(Path(source).read_bytes(), original_bytes)
+            self.assertGreater(Path(output).stat().st_size, 1000)
+            self.assertTrue(Path(spectrogram).is_file())
+
+    def test_spectral_addon_preserves_existing_macro_tremolo_envelope(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sr = 48000
+            t = np.arange(sr * 3) / sr
+            carrier = 0.15 * np.sin(2 * np.pi * 440 * t)
+            # Representative pre-existing macro modulation, deliberately in a
+            # pass band. The add-on must not replace it or flatten its envelope.
+            original = np.column_stack([
+                carrier,
+                carrier * (0.65 + 0.25 * np.sin(2 * np.pi * 4 * t)),
+            ])
+            source = os.path.join(tmp, "macro_output.wav")
+            output = os.path.join(tmp, "macro_plus_spectral.wav")
+            sf.write(source, original, sr, subtype="FLOAT")
+            kt._apply_v4_base_fx(source, output, already_macro=True)
+            actual, rate = sf.read(output, always_2d=True)
+            self.assertEqual(rate, sr)
+            self.assertEqual(actual.shape, original.shape)
+            trim = sr // 10
+            np.testing.assert_allclose(actual[trim:-trim], original[trim:-trim], atol=1e-6, rtol=2e-5)
+
+    def test_spectral_layer_adds_no_whine_wobble_or_new_mono_cancellation(self):
         with tempfile.TemporaryDirectory() as tmp:
             sr = 48000
             t = np.arange(sr * 8) / sr

@@ -1780,12 +1780,13 @@ def copyr8_autofit_v3(input_path, output_path, spectrogram_path, progress=None,
 
 def copyr8_autofit_v4(input_path, output_path, spectrogram_path, progress=None,
                       macro_fn=None):
-    """Auto-Fit V4: static subtractive spectral shaping + clean shift search.
+    """Auto-Fit V4: original macro + separate spectral add-on + shift search.
 
-    The spectral stage processes the source only: no synthetic high-frequency
-    tones, sweeping modulation, or stereo phase cancellation. Narrow, static
-    zero-phase EQ cuts change the spectrogram without adding a whistle/swoosh;
-    the existing probe/search logic still chooses the pitch and tempo shift.
+    The supplied 17-step macro retains its stereo-to-mono/duplicate/pan setup,
+    both original Tremolo settings, and both SC1 passes unchanged. Only AFTER
+    that macro, static zero-phase EQ changes the actual spectrum before probes
+    and on export. The added layer generates no high-pitched tones or sweeps;
+    it does not replace the macro's effects or stack another tremolo overlay.
     """
     return _copyr8_autofit_macro_search(
         input_path, output_path, spectrogram_path, progress=progress,
@@ -1797,9 +1798,9 @@ def _copyr8_autofit_macro_search(input_path, output_path, spectrogram_path,
                                  env_hint="COPYR8_V3_MACRO"):
     """Shared Auto-Fit V3/V4 engine (see copyr8_autofit_v3 and copyr8_autofit_v4).
 
-    `tag` names the temp work files (autofit_<tag>_base.wav / _work.wav) and
-    selects V4's tremolo-free studio + spectrogram-sculpting pipeline when
-    `tag == "v4"`.
+    `tag` names the temp work files (autofit_<tag>_base.wav / _work.wav).
+    V4 adds spectral shaping AFTER its configured macro, without an extra
+    tremolo search/overlay (the original macro already contains tremolo).
     """
     if not os.path.isfile(input_path):
         raise RuntimeError("the input file could not be read from disk.")
@@ -1848,6 +1849,10 @@ def _copyr8_autofit_macro_search(input_path, output_path, spectrogram_path,
                 progress(macro_info["reason"])
 
         if is_v4:
+            if progress:
+                progress("applying the separate V4 spectrogram layer"
+                         + (" after the configured macro (macro steps preserved)..."
+                            if macro_info["applied"] else " (macro not applied)..."))
             try:
                 _apply_v4_base_fx(
                     base_path,

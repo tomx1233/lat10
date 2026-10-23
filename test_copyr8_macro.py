@@ -47,37 +47,29 @@ class BundledMacroTests(unittest.TestCase):
         self.assertGreater(len(":".join(steps[5])), SAFE_COMMAND_BYTES)
 
     def test_v4_exact_step_order_and_settings(self):
-        steps = parse_macro(processor.BUNDLED_V4_MACRO)
-        names = [name for name, _ in steps]
-        self.assertEqual(names, [
-            "SelectAll",
-            "ClipFix",
-            "NotchFilter",
-            "NotchFilter",
-            "NotchFilter",
-            "NotchFilter",
-            "NotchFilter",
-            "NotchFilter",
-            "BassAndTreble",
-            "Compressor",
-            "Limiter",
+        # The user's original 17-step macro is not a replacement EQ chain.
+        # Spectrogram shaping is added by the engine AFTER this whole macro.
+        sc1 = ('Attack_time_(ms)="400" Knee_radius_(dB)="2" Makeup_gain_(dB)="5" '
+               'Ratio_(1_n)="10" Release_time_(ms)="800" Threshold_level_(dB)="-15"')
+        self.assertEqual(parse_macro(processor.BUNDLED_V4_MACRO), [
+            ("SelectAll", ""),
+            ("StereoToMono", 'Use_Preset="<Factory Defaults>"'),
+            ("Duplicate", ""),
+            ("SelectTracks", 'Mode="Set" Track="1" TrackCount="1"'),
+            ("PanRight", ""),
+            ("SelectTracks", 'Mode="Set" Track="0" TrackCount="1"'),
+            ("PanLeft", ""),
+            ("SelectTracks", 'Mode="Set" Track="1" TrackCount="1"'),
+            ("Tremolo", 'lfo="4" phase="60" wave="Sine" wet="50"'),
+            ("SelectTracks", 'Mode="Set" Track="1" TrackCount="1"'),
+            ("Tremolo", 'lfo="4" phase="0" wave="Sine" wet="40"'),
+            ("SelectAll", ""),
+            ("MixAndRender", ""),
+            ("SelectAll", ""),
+            ("Sc1", sc1),
+            ("SelectAll", ""),
+            ("Sc1", sc1),
         ])
-        self.assertNotIn("StereoToMono", names)
-        self.assertNotIn("Tremolo", names)
-        self.assertNotIn("Phaser", names)
-        self.assertNotIn("Reverb", names)
-        self.assertNotIn("Sc1", names)
-        self.assertEqual(
-            [params for name, params in steps if name == "NotchFilter"],
-            [
-                'frequency="980" q="5"',
-                'frequency="1720" q="4.5"',
-                'frequency="2680" q="4.5"',
-                'frequency="3900" q="4"',
-                'frequency="5450" q="4"',
-                'frequency="7350" q="3.5"',
-            ],
-        )
 
     def test_v4_install_is_exact_and_idempotent(self):
         with tempfile.TemporaryDirectory() as tmp, patch.object(processor, "MACRO_DIR", tmp):
@@ -91,18 +83,29 @@ class BundledMacroTests(unittest.TestCase):
     def test_v4_install_precedes_session_and_macro_receives_all_steps(self):
         with tempfile.TemporaryDirectory() as tmp, patch.object(processor, "MACRO_DIR", tmp):
             output = Path(tmp) / "result.wav"
+            installed = Path(tmp) / processor.BUNDLED_V4_MACRO.name
+            # Simulate upgrading from the mistakenly substituted macro.
+            installed.write_text('SelectAll:\nClipFix:gain="-4" threshold="92"\n')
+            custom = Path(tmp) / "My custom chain.txt"
+            custom.write_text('ChangeTempo:Percentage="1"')
             session = Mock()
             session.check_effects.return_value = ([], [])
             session.macro_menu_available.return_value = True
             session.apply_macro_to_file.side_effect = lambda *a, **kw: output.write_bytes(b"audio")
-            with patch.object(processor, "_get_session", return_value=session), \
+
+            def get_session():
+                self.assertEqual(installed.read_bytes(), processor.BUNDLED_V4_MACRO.read_bytes())
+                return session
+
+            with patch.object(processor, "_get_session", side_effect=get_session), \
                  patch.object(processor, "_drop_session") as drop, \
                  patch.object(processor, "preserve_metadata", return_value=True):
                 result = processor.run_macro_blocking(
                     "input.wav", str(output), str(processor.BUNDLED_V4_MACRO))
                 drop.assert_called_once_with()
-                self.assertEqual(len(result["steps"]), 11)
+                self.assertEqual(len(result["steps"]), 17)
                 self.assertTrue(result["metadata"])
+                self.assertEqual(custom.read_text(), 'ChangeTempo:Percentage="1"')
                 session.apply_macro_to_file.assert_called_once_with(
                     "input.wav", str(output), parse_macro(processor.BUNDLED_V4_MACRO),
                     macro_name=processor.BUNDLED_V4_MACRO.stem,
