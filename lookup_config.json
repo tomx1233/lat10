@@ -1,0 +1,13 @@
+{
+  "language": "en-US",
+  "endpoint_country": "US",
+  "recognize_timeout_seconds": 60,
+  "cache_duration_seconds": 1800,
+  "cache_file": "lookup_cache.json",
+  "max_cache_entries": 500,
+  "max_file_size_mb": 25,
+  "max_queue": 5,
+  "max_retries": 3,
+  "backoff_base_seconds": 4,
+  "segment_duration_seconds": 0
+}
