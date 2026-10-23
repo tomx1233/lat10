@@ -465,21 +465,47 @@ class CleanMetadataAndV4AudioTests(unittest.TestCase):
                 res["loudness"]["out_lufs"], res["loudness"]["source_lufs"], delta=1.5
             )
 
+            # Verify zero synthetic oscillators or LFO wave filters exist in V4's filter graph
+            fc_str = kt._v4_sculpt_filter_complex(0.0, kt.AUTOFIT_CLIP_THRESHOLD, 10.0)
+            for banned_dsp in ("aeval", "sin(", "flanger", "aphaser", "vibrato", "crystalizer"):
+                self.assertNotIn(banned_dsp, fc_str)
+
             # Verify zero AI/encoder metadata bytes in exported MP3
             raw_out = Path(out_mp3).read_bytes()
             for forbidden in (b"Suno", b"Created with", b"AI Generated", b"Lavf", b"Lavc", b"Xing"):
                 self.assertNotIn(forbidden, raw_out)
 
-            # Verify strong spectrogram transformation in BOTH upper helix (rows 40..105)
-            # AND audible mid/high weave + carved bands (rows 110..240)!
+            # Verify acoustic cleanliness: high-frequency band (>15 kHz) is silenced
+            # (never boosted / zero high-pitch noise) and notch centers are deeply attenuated.
+            dec_src = os.path.join(tmp, "dec_src.wav")
+            dec_out = os.path.join(tmp, "dec_out.wav")
+            subprocess.run([kt._FFMPEG_BIN, "-y", "-loglevel", "error", "-i", tagged_mp3, dec_src], check=True)
+            subprocess.run([kt._FFMPEG_BIN, "-y", "-loglevel", "error", "-i", out_mp3, dec_out], check=True)
+            y_src, sr_src = sf.read(dec_src)
+            y_out, sr_out = sf.read(dec_out)
+            f_src = np.fft.rfftfreq(len(y_src), 1.0 / sr_src)
+            f_out = np.fft.rfftfreq(len(y_out), 1.0 / sr_out)
+            spec_src = np.mean(np.abs(np.fft.rfft(y_src, axis=0)), axis=1) / max(len(y_src), 1)
+            spec_out = np.mean(np.abs(np.fft.rfft(y_out, axis=0)), axis=1) / max(len(y_out), 1)
+
+            hf_src_db = 20.0 * np.log10(float(np.mean(spec_src[f_src >= 15000])) + 1e-12)
+            hf_out_db = 20.0 * np.log10(float(np.mean(spec_out[f_out >= 15000])) + 1e-12)
+            # >15 kHz must be strongly attenuated relative to source (zero high-pitched whine)
+            self.assertLess(hf_out_db, hf_src_db - 20.0)
+
+            for center_hz, half_w in kt._V4_SCULPT_NOTCHES[:6]:
+                mask = (f_out >= center_hz - half_w * 0.6) & (f_out <= center_hz + half_w * 0.6)
+                notch_db = 20.0 * np.log10(float(np.mean(spec_out[mask])) + 1e-12)
+                pass_mask = (f_out >= 400) & (f_out <= 850)
+                pass_db = 20.0 * np.log10(float(np.mean(spec_out[pass_mask])) + 1e-12)
+                self.assertLess(notch_db, pass_db - 20.0)
+
+            # Verify strong visible carved bands on the branded spectrogram PNG
             img_orig = np.asarray(Image.open(orig_spec).convert("RGB"), dtype=np.float32)
             img_v4 = np.asarray(Image.open(v4_spec).convert("RGB"), dtype=np.float32)
-            upper_patch_diff = np.linalg.norm(img_v4[40:105, :, :] - img_orig[40:105, :, :], axis=-1)
-            audible_patch_diff = np.linalg.norm(img_v4[110:240, :, :] - img_orig[110:240, :, :], axis=-1)
-            self.assertGreater(float(np.mean(upper_patch_diff)), 14.0)
-            self.assertGreater(float(np.percentile(upper_patch_diff, 95)), 40.0)
-            self.assertGreater(float(np.mean(audible_patch_diff)), 7.5)
-            self.assertGreater(float(np.percentile(audible_patch_diff, 95)), 22.0)
+            carved_diff = np.linalg.norm(img_v4[60:265, :, :] - img_orig[60:265, :, :], axis=-1)
+            self.assertGreater(float(np.mean(carved_diff)), 8.0)
+            self.assertGreater(float(np.percentile(carved_diff, 95)), 24.0)
 
 
 class PacingAndInterAudioTestingTests(unittest.TestCase):

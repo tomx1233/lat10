@@ -306,87 +306,73 @@ AUTOFIT_PEAK_SLACK_DB = 1.0       # allowed above the source's own true peak
 AUTOFIT_PEAK_CAP_DB = 3.0         # cap used when the source can't be measured
 
 
-_V4_SCULPT_BANDS = (
-    # (valley_center_hz, valley_half_width_hz, ridge_center_hz, ridge_gain_db)
-    (1550, 200, 2150, 3.6),
-    (2950, 300, 3800, 4.6),
-    (4800, 420, 5950, 5.4),
-    (7250, 560, 8750, 5.8),
-    (10400, 700, 12200, 6.0),
+_V4_SCULPT_NOTCHES = (
+    # Purely subtractive sub-critical-band notches (center_hz, half_width_hz).
+    # Zero synthetic oscillators, zero LFO flanger/phaser waves, zero treble boosts.
+    (980, 55),
+    (1720, 95),
+    (2680, 155),
+    (3900, 230),
+    (5450, 320),
+    (7350, 430),
+    (9650, 550),
+    (12350, 660),
 )
 
 
-def _v4_probe_gain_entry():
-    """Zero-passband probe notch curve so recognition probes see V4's spectral cuts."""
-    entries = ["entry(0,0)"]
-    for vc, vhw, _rc, _rg in _V4_SCULPT_BANDS:
-        entries.append(f"entry({vc - vhw - 90},0)")
-        entries.append(f"entry({vc - vhw},-65)")
-        entries.append(f"entry({vc + vhw},-65)")
-        entries.append(f"entry({vc + vhw + 90},0)")
-    entries.append("entry(13400,0)")
-    entries.append("entry(14200,-65)")
-    entries.append("entry(24000,-65)")
-    return ";".join(entries)
-
-
 def _v4_comb_gain_entry():
-    """High-contrast Blackman-Harris zero-phase FIR curve for Auto-Fit V4 export."""
-    entries = ["entry(0,0.4)", "entry(950,1.2)", "entry(1220,2.4)"]
-    for vc, vhw, rc_f, rg in _V4_SCULPT_BANDS:
-        entries.append(f"entry({vc - vhw},-95)")
-        entries.append(f"entry({vc + vhw},-95)")
-        entries.append(f"entry({rc_f - 160},{rg})")
-        entries.append(f"entry({rc_f + 160},{rg})")
-    entries.append("entry(13400,-95)")
+    """Subtractive Blackman-Harris zero-phase FIR curve for Auto-Fit V4 (no high-pitch boosts)."""
+    entries = ["entry(0,0)", "entry(700,0)"]
+    for center, half_w in _V4_SCULPT_NOTCHES:
+        entries.append(f"entry({center - half_w - 80},0)")
+        entries.append(f"entry({center - half_w},-95)")
+        entries.append(f"entry({center + half_w},-95)")
+        entries.append(f"entry({center + half_w + 80},0)")
+    entries.append("entry(13850,-1.5)")
+    entries.append("entry(14550,-95)")
     entries.append("entry(24000,-95)")
     return ";".join(entries)
 
 
-def _apply_v4_base_fx(input_path, out_wav, *, already_macro=False):
-    """Apply V4's slightly audible stereo motion + anti-fingerprint weave before API probing."""
-    try:
-        dur = max(float(_duration_seconds(input_path) or 30.0), 8.0)
-    except Exception:
-        dur = 30.0
-    fm1 = max(0.03, min(0.45, round(4.0 / dur, 5)))
-    fm2 = max(0.02, min(0.35, round(2.5 / dur, 5)))
-    fm3 = max(0.04, min(0.55, round(5.5 / dur, 5)))
-    b1 = round(900.0 / fm2, 2)
-    b2 = round(1250.0 / fm3, 2)
-    b3 = round(1550.0 / fm1, 2)
+def _v4_spectral_filter(delay, duration_secs=None):
+    """Static EQ with FIR latency removed and, when known, source length preserved."""
+    trim = "atrim=start=0"
+    if duration_secs is not None:
+        seconds = float(duration_secs)
+        if math.isfinite(seconds) and seconds > 0:
+            trim += f":end={seconds:.9f}"
+    # zero_phase shifts timestamps; atrim actually removes the negative-time
+    # samples so WAV/MP3 muxers don't turn FIR latency into extra leading audio.
+    return (
+        f"firequalizer=gain_entry='{_v4_comb_gain_entry()}':"
+        f"zero_phase=1:wfunc=bharris:delay={delay},"
+        f"{trim},asetpts=PTS-STARTPTS"
+    )
 
-    pre = (
-        "aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,"
-        "vibrato=f=0.84:d=0.09,"
-        "flanger=delay=0.62:depth=0.45:regen=56:width=82:speed=0.17:"
-        "shape=sinusoidal:phase=42:interp=quadratic"
-    )
+
+def _apply_v4_base_fx(input_path, out_wav, *, already_macro=False):
+    """Apply static, source-only spectral cuts before V4's recognition probes.
+
+    No generated tones or time-varying modulation. Both channels receive the
+    same EQ, without differential phase tricks that hollow out mono playback.
+    Skip the extra compressor when Audacity has already applied the macro.
+    """
+    pre = "aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo"
     if not already_macro:
-        pre += (
-            ",aphaser=in_gain=0.88:out_gain=0.95:delay=1.8:decay=0.40:speed=0.25:type=triangular,"
-            "extrastereo=m=1.18,crystalizer=i=0.45,"
-            "acompressor=threshold=-16dB:ratio=1.8:attack=24:release=210:makeup=1.0dB"
-        )
-    p_ge = _v4_probe_gain_entry()
-    rib0 = (
-        f"min(0.065,max(0,val(0)*0.42-0.002))*("
-        f"0.12*sin(2*PI*4800*t+{b1}*sin(2*PI*{fm2}*t))"
-        f"+0.22*sin(2*PI*7800*t-{b2}*sin(2*PI*{fm3}*t))"
-        f"+0.35*sin(2*PI*11400*t+{b3}*sin(2*PI*{fm1}*t+0.6))"
-        f")"
+        pre += ",acompressor=threshold=-16dB:ratio=1.6:attack=28:release=240:makeup=0.8dB"
+    try:
+        duration_secs = _duration_seconds(input_path)
+    except Exception:
+        duration_secs = None
+    fc = f"[0:a]{pre},{_v4_spectral_filter(0.035, duration_secs)}"
+    dst_tmp = (
+        out_wav + ".v4fx.wav"
+        if os.path.abspath(input_path) == os.path.abspath(out_wav)
+        else out_wav
     )
-    rib1 = rib0.replace("val(0)", "val(1)").replace("+0.6))", "+1.5))")
-    fc = (
-        f"[0:a]{pre},asplit=2[bm][br];"
-        f"[bm]firequalizer=gain_entry='{p_ge}':zero_phase=1:wfunc=bharris:delay=0.03[bm2];"
-        f"[br]aeval='abs(val(0))|abs(val(1))',lowpass=f=1.0,lowpass=f=1.0,lowpass=f=1.0,"
-        f"aeval='{rib0}|{rib1}',highpass=f=3600[br2];"
-        f"[bm2][br2]amix=inputs=2:duration=first:dropout_transition=0:normalize=0"
-    )
-    dst_tmp = out_wav + ".v4fx.wav" if os.path.abspath(input_path) == os.path.abspath(out_wav) else out_wav
     rc, _out, err = _run(
-        _FFMPEG + ["-i", input_path, "-filter_complex", fc] + _CLEAN_META_FLAGS + [dst_tmp]
+        _FFMPEG + ["-i", input_path, "-filter_complex", fc]
+        + _CLEAN_META_FLAGS + ["-c:a", "pcm_f32le", dst_tmp]
     )
     if rc != 0:
         raise RuntimeError("V4 studio base render failed."
@@ -397,55 +383,20 @@ def _apply_v4_base_fx(input_path, out_wav, *, already_macro=False):
 
 
 def _render_v4_studio_base(input_path, out_wav):
-    """Render V4's stereo studio FX + spectral base WAV when Audacity isn't running."""
+    """Render V4's clean static stereo studio + spectral-carve base WAV."""
     return _apply_v4_base_fx(input_path, out_wav, already_macro=False)
 
 
-def _v4_sculpt_filter_complex(gain_db, clip_threshold, duration_secs):
-    """Build V4's high-contrast spectral sculpt + slightly audible twin-rail weave graph."""
-    dur = max(float(duration_secs or 30.0), 8.0)
-    fm1 = max(0.03, min(0.45, round(4.0 / dur, 5)))
-    fm2 = max(0.02, min(0.35, round(2.5 / dur, 5)))
-    fm3 = max(0.04, min(0.55, round(5.5 / dur, 5)))
-    b1 = round(900.0 / fm2, 2)
-    b2 = round(1250.0 / fm3, 2)
-    b3 = round(1550.0 / fm1, 2)
-    b4 = round(2300.0 / fm1, 2)
-    b5 = round(1700.0 / fm2, 2)
-
-    # Rectified + 4x 0.8 Hz lowpass envelope keeps zero bass AM sideband haze while gating silence.
-    env_gate = "min(0.145,max(0,val(0)*0.82-0.003))"
-    rib_ch0 = (
-        f"{env_gate}*("
-        f"0.075*sin(2*PI*4800*t+{b1}*sin(2*PI*{fm2}*t))"
-        f"+0.070*sin(2*PI*5020*t+{b1}*sin(2*PI*{fm2}*t))"
-        f"+0.18*sin(2*PI*7800*t-{b2}*sin(2*PI*{fm3}*t))"
-        f"+0.16*sin(2*PI*8040*t-{b2}*sin(2*PI*{fm3}*t))"
-        f"+0.38*sin(2*PI*11400*t+{b3}*sin(2*PI*{fm1}*t+0.6))"
-        f"+0.35*sin(2*PI*11660*t-{b3}*sin(2*PI*{fm1}*t+2.0))"
-        f"+0.82*sin(2*PI*16800*t+{b4}*sin(2*PI*{fm1}*t))"
-        f"+0.76*sin(2*PI*17080*t+{b4}*sin(2*PI*{fm1}*t))"
-        f"+0.78*sin(2*PI*16800*t-{b4}*sin(2*PI*{fm1}*t))"
-        f"+0.74*sin(2*PI*17080*t-{b4}*sin(2*PI*{fm1}*t))"
-        f"+0.68*sin(2*PI*18400*t+{b5}*cos(2*PI*{fm2}*t))"
-        f")"
-    )
-    rib_ch1 = rib_ch0.replace("val(0)", "val(1)").replace("+0.6))", "+1.5))")
-    gain_entry = _v4_comb_gain_entry()
-    # Softclip runs BEFORE Blackman-Harris firequalizer so distortion never refills carved notches.
+def _v4_sculpt_filter_complex(gain_db, clip_threshold, duration_secs=None):
+    """Build V4's clean loudness-restore + Blackman-Harris subtractive spectral carve."""
+    # Any harmonics from soft clipping are filtered, not added after the final EQ.
+    # There is deliberately no independent tone/noise source or modulation branch.
     return (
-        f"[0:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,asplit=2[s_main][s_rib];"
-        f"[s_main]volume={gain_db:.2f}dB,"
-        f"flanger=delay=0.48:depth=0.36:regen=48:width=76:speed=0.22:"
-        f"shape=sinusoidal:phase=38:interp=quadratic,"
+        f"[0:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,"
+        f"volume={gain_db:.2f}dB,"
         f"asoftclip=type=atan:oversample=4:threshold={clip_threshold},"
-        f"volume=0.78,"
-        f"firequalizer=gain_entry='{gain_entry}':zero_phase=1:wfunc=bharris:delay=0.04[main];"
-        f"[s_rib]aeval='abs(val(0))|abs(val(1))',"
-        f"lowpass=f=0.8,lowpass=f=0.8,lowpass=f=0.8,lowpass=f=0.8,"
-        f"aeval='{rib_ch0}|{rib_ch1}',"
-        f"highpass=f=3600,highpass=f=3600[rib];"
-        f"[main][rib]amix=inputs=2:duration=first:dropout_transition=0:normalize=0"
+        f"volume=0.88,"
+        f"{_v4_spectral_filter(0.04, duration_secs)}"
     )
 
 
@@ -466,7 +417,7 @@ def _match_loudness(work_wav, output_path, source_path, progress=None, *, v4_scu
     try:
         work_dur = _duration_seconds(work_wav)
     except Exception:
-        work_dur = 30.0
+        work_dur = None
 
     def _encode(dst, gain_db):
         if v4_sculpt:
@@ -474,7 +425,7 @@ def _match_loudness(work_wav, output_path, source_path, progress=None, *, v4_scu
             cmd = (
                 _FFMPEG + ["-i", work_wav, "-filter_complex", fc]
                 + _CLEAN_MP3_FLAGS
-                + ["-c:a", "libmp3lame", "-b:a", "320k", "-cutoff", "21500", dst]
+                + ["-c:a", "libmp3lame", "-b:a", "320k", dst]
             )
         else:
             af = (f"volume={gain_db:.2f}dB,asoftclip=type=atan:oversample=4"
@@ -1829,13 +1780,12 @@ def copyr8_autofit_v3(input_path, output_path, spectrogram_path, progress=None,
 
 def copyr8_autofit_v4(input_path, output_path, spectrogram_path, progress=None,
                       macro_fn=None):
-    """Auto-Fit V4: stereo studio FX + zero-phase spectral sculpting + clean search.
+    """Auto-Fit V4: static subtractive spectral shaping + clean shift search.
 
-    Preserves full stereo imaging and natural tonal balance (no mono collapse,
-    no tremolo warble, and no dual-SC1 compression pumping) while applying
-    phase dispersion, subtle phaser/stereo width, sub-critical-band zero-phase
-    FIR comb sculpting, and an envelope-gated ultrasonic double-helix braid so
-    the spectrogram looks distinctly transformed while the audio sounds clean.
+    The spectral stage processes the source only: no synthetic high-frequency
+    tones, sweeping modulation, or stereo phase cancellation. Narrow, static
+    zero-phase EQ cuts change the spectrogram without adding a whistle/swoosh;
+    the existing probe/search logic still chooses the pitch and tempo shift.
     """
     return _copyr8_autofit_macro_search(
         input_path, output_path, spectrogram_path, progress=progress,

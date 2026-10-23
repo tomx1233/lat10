@@ -23,7 +23,7 @@ DMs, other servers, any channel. The owner can always run everything:
                                 Auto-Fit V2 = closest-sounding search, mildest first, with tremolo test.
                                 Auto-Fit V3 = bundled macro chain + mixed search that
                                               reuses both playbooks until it's unreadable.
-                                Auto-Fit V4 = mono wobble macro chain + V3's mixed search.
+                                Auto-Fit V4 = clean stereo spectral cuts + V3's mixed search.
                                 Subtle / Balanced / Stealth / Aggressive = fixed key/speed shifts.
   /lookup <file>              -- identify a song with Shazam: title, artist, album,
                                  release, cover art, and a link to the Shazam page.
@@ -160,8 +160,8 @@ COPYR8_COOLDOWN_SECONDS = min(
 AUTOFIT_V3_MACRO = os.getenv("COPYR8_V3_MACRO", "").strip() or os.path.join(
     HERE, "macros", "CopyR8 AutoFit V3.txt")
 
-# Same pattern for /copyr8's Auto-Fit V4 (the mono wobble chain: Stereo to
-# Mono -> duplicate panned L/R -> Tremolo x2 on the right -> Mix -> SC1 x2).
+# Same pattern for /copyr8's Auto-Fit V4 (static stereo EQ, no generated tones
+# or sweeping modulation; the search layer chooses any pitch/tempo shifts).
 AUTOFIT_V4_MACRO = os.getenv("COPYR8_V4_MACRO", "").strip() or os.path.join(
     HERE, "macros", "CopyR8 AutoFit V4.txt")
 

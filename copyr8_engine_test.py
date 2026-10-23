@@ -472,7 +472,7 @@ assert (res["pitch"], res["tempo"]) == (-0.2, 1.10), res
 assert os.path.isfile(out21)
 print("22. V2 head-hook flagged OK: intro probe aligned, clean = False")
 
-# ---- 9. Auto-Fit V4: V3's engine, the V4 (mono wobble) macro chain --------
+# ---- 9. Auto-Fit V4: V3's search with clean stereo spectral cuts ----------
 def v4_base_clean(clip, progress=None):
     probes["seen"].append(clip)
     if "song.wav" in clip:

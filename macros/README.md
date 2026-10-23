@@ -13,27 +13,33 @@ original command names, parameter values, and order preserved:
 6. TDR Nova
 7. Bass and Treble (`Treble=-17`)
 
-## `CopyR8 AutoFit V4.txt` -- twelve-step stereo studio + spectral sculpt chain
+## `CopyR8 AutoFit V4.txt` -- eleven-step clean stereo spectral-carve chain
 
-`CopyR8 AutoFit V4.txt` keeps full stereo imaging and natural tonal balance
-(no mono fold-down, no tremolo warble, and no heavy dual-SC1 pumping) while
-applying a slightly audible stereo phaser/reverb sheen, wide sub-critical
-spectral notches, gentle bus compression, and soft limiting before V4's
-sweeping flanger, Blackman-Harris zero-phase spectral sculptor, and multi-tier
-twin-rail harmonic & double-helix weave run prior to probing and on export:
+V4 now shapes only the source audio. The synthetic high-frequency ribbons,
+flanger/phaser sweeps, vibrato, and treble boosts have been removed from both
+the base render and final export. The replacement uses static subtractive EQ,
+a treble taper, light compression, and soft limiting. Both channels receive the
+same EQ, preserving the stereo image without destructive mono phase tricks.
+Pitch/tempo changes remain the job of the existing tested shift-search layer,
+not an extra hidden adjustment in the macro.
 
 1. Select All
-2. Clip Fix (`gain=-3`, `threshold=95`)
-3. Phaser (6-stage, `Freq=0.24`, `Depth=115`, `DryWet=165`, `Feedback=32`)
-4. Reverb (short stereo studio air, `RoomSize=18`, `WetGain=-19`, `StereoWidth=38`)
-5. Notch Filter (`1550 Hz`, `Q=4.5`)
-6. Notch Filter (`2950 Hz`, `Q=4.5`)
-7. Notch Filter (`4800 Hz`, `Q=4.5`)
-8. Notch Filter (`7250 Hz`, `Q=4.5`)
-9. Notch Filter (`10400 Hz`, `Q=4.5`)
-10. Bass and Treble (`Treble=+2`)
-11. Compressor (`Ratio=1.8:1`, `Threshold=-16 dB`, `Normalize=0`)
-12. Limiter (`SoftLimit`, `thresh=-0.8 dB`, `hold=8 ms`)
+2. Clip Fix (`gain=-4`, `threshold=92`)
+3. Notch Filter (`980 Hz`, `Q=5`)
+4. Notch Filter (`1720 Hz`, `Q=4.5`)
+5. Notch Filter (`2680 Hz`, `Q=4.5`)
+6. Notch Filter (`3900 Hz`, `Q=4`)
+7. Notch Filter (`5450 Hz`, `Q=4`)
+8. Notch Filter (`7350 Hz`, `Q=3.5`)
+9. Bass and Treble (`Bass=-1.5`, `Treble=-2.5`)
+10. Compressor (`Ratio=1.6:1`, `Threshold=-16 dB`, `Normalize=0`)
+11. Limiter (`SoftLimit`, `thresh=-0.8 dB`, `hold=8 ms`)
+
+Before recognition probes and at export, ffmpeg applies Blackman-Harris
+zero-phase cuts at `980, 1720, 2680, 3900, 5450, 7350, 9650, 12350 Hz`,
+with no positive EQ gain and a tapered ceiling above `14.5 kHz`. There are no
+tone/noise generators or time-varying modulation branches. The spectrogram is
+still rendered from the actual exported audio, not a decorative overlay.
 
 ## Scope and defaults
 
@@ -55,10 +61,12 @@ The Audacity integration targets **Audacity 2.3.3 on Windows**:
   Audacity.
 - V3 needs **Blue Cat's Triple EQ (stereo)** and **TdrNova** installed in
   Audacity (`BcTripleEq4(stereo)` and `TdrNova`). V4 uses built-in Audacity
-  2.3.3 effects and bundled Nyquist filters (`ClipFix`, `Phaser`, `Reverb`,
-  `NotchFilter`, `BassAndTreble`, `Compressor`, `Limiter`).
+  2.3.3 effects and bundled Nyquist filters (`ClipFix`, `NotchFilter`,
+  `BassAndTreble`, `Compressor`, `Limiter`).
 - Ensure `%APPDATA%\Audacity\Macros` is writable.
 
 ## Tests
 
-Run `python -m unittest -v test_copyr8_macro` from the repository root.
+Run `python -m unittest -v test_copyr8_macro test_v4_audio` from the repository
+root. The signal tests render real audio and check for added high-frequency
+energy, level wobble, channel/mono damage, silence leakage, and spectral cuts.
