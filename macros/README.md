@@ -13,25 +13,27 @@ original command names, parameter values, and order preserved:
 6. TDR Nova
 7. Bass and Treble (`Treble=-17`)
 
-## `CopyR8 AutoFit V4.txt` -- eleven-step stereo studio + spectral comb chain
+## `CopyR8 AutoFit V4.txt` -- twelve-step stereo studio + spectral sculpt chain
 
 `CopyR8 AutoFit V4.txt` keeps full stereo imaging and natural tonal balance
 (no mono fold-down, no tremolo warble, and no heavy dual-SC1 pumping) while
-applying phase movement, room air, narrow high-Q spectral comb notches, gentle
-bus compression, and soft limiting before the V4 zero-phase FIR spectral
-sculptor and ultrasonic braid run on export:
+applying a slightly audible stereo phaser/reverb sheen, wide sub-critical
+spectral notches, gentle bus compression, and soft limiting before V4's
+sweeping flanger, Blackman-Harris zero-phase spectral sculptor, and multi-tier
+twin-rail harmonic & double-helix weave run prior to probing and on export:
 
 1. Select All
 2. Clip Fix (`gain=-3`, `threshold=95`)
-3. Phaser (4-stage, `Freq=0.25`, `Depth=45`, `DryWet=55`, `Feedback=12`)
-4. Reverb (short studio air, `RoomSize=16`, `WetGain=-22`, `StereoWidth=32`)
-5. Notch Filter (`2550 Hz`, `Q=10`)
-6. Notch Filter (`5050 Hz`, `Q=10`)
-7. Notch Filter (`8500 Hz`, `Q=10`)
-8. Notch Filter (`12950 Hz`, `Q=10`)
-9. Bass and Treble (`Treble=+1.5`)
-10. Compressor (`Ratio=1.8:1`, `Threshold=-16 dB`, `Normalize=0`)
-11. Limiter (`SoftLimit`, `thresh=-0.8 dB`, `hold=8 ms`)
+3. Phaser (6-stage, `Freq=0.24`, `Depth=115`, `DryWet=165`, `Feedback=32`)
+4. Reverb (short stereo studio air, `RoomSize=18`, `WetGain=-19`, `StereoWidth=38`)
+5. Notch Filter (`1550 Hz`, `Q=4.5`)
+6. Notch Filter (`2950 Hz`, `Q=4.5`)
+7. Notch Filter (`4800 Hz`, `Q=4.5`)
+8. Notch Filter (`7250 Hz`, `Q=4.5`)
+9. Notch Filter (`10400 Hz`, `Q=4.5`)
+10. Bass and Treble (`Treble=+2`)
+11. Compressor (`Ratio=1.8:1`, `Threshold=-16 dB`, `Normalize=0`)
+12. Limiter (`SoftLimit`, `thresh=-0.8 dB`, `hold=8 ms`)
 
 ## Scope and defaults
 

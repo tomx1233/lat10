@@ -191,11 +191,81 @@ class SpotifyAndSoundCloudDownloadTests(unittest.TestCase):
         self.assertEqual(pmeta["title"], "Nightcall")
         self.assertEqual(pmeta["artist"], "Kavinsky")
 
+    def test_verify_song_candidate_accepts_exact_song_and_rejects_wrong_songs_or_versions(self):
+        # 1. Exact YouTube Topic / Official Audio match (including feat. & Remaster tags)
+        ok, score, _ = kt.verify_song_candidate(
+            {
+                "title": "Starboy",
+                "track": "Starboy",
+                "uploader": "The Weeknd - Topic",
+                "artist": "The Weeknd, Daft Punk",
+                "duration": 230,
+                "webpage_url": "https://www.youtube.com/watch?v=abc123",
+            },
+            "Starboy (feat. Daft Punk)",
+            "The Weeknd, Daft Punk",
+            exp_duration_secs=230.4,
+        )
+        self.assertTrue(ok)
+        self.assertGreater(score, 150.0)
+
+        #Song legitimately containing "Live" in its own title ("Live Forever") passes once,
+        #while a live concert version ("Live Forever (Live at Maine Road)") is rejected!
+        ok_lf, _, _ = kt.verify_song_candidate(
+            {
+                "title": "Oasis - Live Forever (Official Audio)",
+                "uploader": "OasisVEVO",
+                "duration": 276,
+                "webpage_url": "https://www.youtube.com/watch?v=lf1",
+            },
+            "Live Forever - Remastered",
+            "Oasis",
+            exp_duration_secs=276.0,
+        )
+        self.assertTrue(ok_lf)
+        bad_lf, _, _ = kt.verify_song_candidate(
+            {
+                "title": "Oasis - Live Forever (Live at Knebworth)",
+                "uploader": "OasisVEVO",
+                "duration": 278,
+                "webpage_url": "https://www.youtube.com/watch?v=lf2",
+            },
+            "Live Forever",
+            "Oasis",
+            exp_duration_secs=276.0,
+        )
+        self.assertFalse(bad_lf)
+
+        # 2. Wrong song by the SAME artist -> REJECTED
+        for wrong_cand in (
+            # Completely different song by same artist
+            {"title": "The Weeknd - Blinding Lights (Official Audio)", "uploader": "TheWeekndVEVO", "duration": 228},
+            # Prefix/extra-word trap ("Run" vs "Runaway" / "Run It Up")
+            {"title": "The Weeknd - Starboy Intro", "uploader": "TheWeekndVEVO", "duration": 230},
+            # Slowed + reverb edit when normal song requested
+            {"title": "The Weeknd - Starboy (Slowed + Reverb)", "uploader": "TheWeekndVEVO", "duration": 232},
+            # Remix when original requested
+            {"title": "The Weeknd - Starboy (Kygo Remix)", "uploader": "TheWeekndVEVO", "duration": 229},
+            # Cover by another artist
+            {"title": "Starboy - Acoustic Cover", "uploader": "Indie Cover Channel", "duration": 230},
+            # Same title by a totally different artist
+            {"title": "Other Artist - Starboy (Official Audio)", "uploader": "Other Artist - Topic", "duration": 230},
+            # Duration way off (extended/radio edit or wrong upload)
+            {"title": "The Weeknd - Starboy (Official Audio)", "uploader": "TheWeekndVEVO", "duration": 182},
+            # 30-second preview stub
+            {"title": "The Weeknd - Starboy", "uploader": "The Weeknd", "duration": 30},
+        ):
+            wrong_cand["webpage_url"] = "https://www.youtube.com/watch?v=wrong"
+            matched, _, reason = kt.verify_song_candidate(
+                wrong_cand, "Starboy", "The Weeknd", exp_duration_secs=230.0
+            )
+            self.assertFalse(matched, f"Should have rejected {wrong_cand['title']!r} ({reason})")
+
     def test_download_media_spotify_falls_back_to_soundcloud_search_and_strips_metadata(self):
         with tempfile.TemporaryDirectory() as tmp:
             sample_mp3 = os.path.join(tmp, "seed.mp3")
             seed_wav = os.path.join(tmp, "seed.wav")
-            _make_stereo_music_wav(seed_wav, duration_s=2.0)
+            _make_stereo_music_wav(seed_wav, duration_s=45.0, sr=24000)
             subprocess.run(
                 [kt._FFMPEG_BIN, "-y", "-loglevel", "error", "-i", seed_wav,
                  "-metadata", "comment=Made with Suno AI", "-c:a", "libmp3lame", sample_mp3],
@@ -203,11 +273,30 @@ class SpotifyAndSoundCloudDownloadTests(unittest.TestCase):
             )
 
             seen_targets = []
+            sc_track_url = "https://soundcloud.com/theweeknd/starboy"
 
             def fake_run_yt(cmd, timeout, what="yt-dlp"):
                 target = cmd[-1]
                 seen_targets.append(target)
-                if target.startswith("scsearch1:"):
+                if "--dump-json" in cmd:
+                    if target.startswith("ytsearch5:"):
+                        # Return only a wrong remix on YT -> must be rejected!
+                        bad_json = json.dumps({
+                            "title": "The Weeknd - Starboy (Slowed + Reverb)",
+                            "uploader": "Random Edits",
+                            "duration": 45,
+                            "webpage_url": "https://www.youtube.com/watch?v=badedit",
+                        })
+                        return 0, bad_json + "\n", ""
+                    if target.startswith("scsearch5:"):
+                        good_json = json.dumps({
+                            "title": "The Weeknd - Starboy",
+                            "uploader": "The Weeknd",
+                            "duration": 45,
+                            "webpage_url": sc_track_url,
+                        })
+                        return 0, good_json + "\n", ""
+                if target == sc_track_url and "-o" in cmd:
                     out_idx = cmd.index("-o") + 1
                     dst = cmd[out_idx].replace("%(ext)s", "mp3")
                     Path(dst).write_bytes(Path(sample_mp3).read_bytes())
@@ -220,7 +309,7 @@ class SpotifyAndSoundCloudDownloadTests(unittest.TestCase):
                  patch.object(kt, "resolve_spotify_metadata", return_value={
                      "title": "Starboy",
                      "artist": "The Weeknd",
-                     "duration_secs": 230.0,
+                     "duration_secs": 45.0,
                      "canonical_url": "https://open.spotify.com/track/7MXVkk9YMctZqd1Srtv4MB",
                      "item_type": "track",
                  }), \
@@ -231,14 +320,57 @@ class SpotifyAndSoundCloudDownloadTests(unittest.TestCase):
                     kind="audio",
                 )
 
-            self.assertTrue(any(t.startswith("ytsearch3:") for t in seen_targets))
-            self.assertTrue(any(t.startswith("scsearch1:") for t in seen_targets))
+            self.assertTrue(any(t.startswith("ytsearch5:") for t in seen_targets))
+            self.assertTrue(any(t.startswith("scsearch5:") for t in seen_targets))
+            self.assertIn(sc_track_url, seen_targets)
+            self.assertNotIn("https://www.youtube.com/watch?v=badedit", seen_targets)
             self.assertEqual(info["title"], "The Weeknd - Starboy")
-            self.assertEqual(info["duration"], "3:50")
+            self.assertEqual(info["duration"], "0:45")
             self.assertTrue(os.path.isfile(info["path"]))
             raw_bytes = Path(info["path"]).read_bytes()
             self.assertNotIn(b"Suno", raw_bytes)
             self.assertNotIn(b"Lavf", raw_bytes)
+
+    def test_download_media_refuses_to_download_when_only_wrong_songs_exist(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            def fake_run_yt(cmd, timeout, what="yt-dlp"):
+                if "--dump-json" in cmd:
+                    mismatches = "\n".join([
+                        json.dumps({
+                            "title": "The Weeknd - Blinding Lights (Official Audio)",
+                            "uploader": "TheWeekndVEVO",
+                            "duration": 200,
+                            "webpage_url": "https://www.youtube.com/watch?v=wrong1",
+                        }),
+                        json.dumps({
+                            "title": "Starboy (Acoustic Cover)",
+                            "uploader": "Cover Singer",
+                            "duration": 230,
+                            "webpage_url": "https://www.youtube.com/watch?v=wrong2",
+                        }),
+                    ])
+                    return 0, mismatches + "\n", ""
+                raise AssertionError("Should NEVER invoke yt-dlp download on unverified candidates!")
+
+            out_dir = os.path.join(tmp, "refused_dl")
+            os.makedirs(out_dir)
+            with patch.object(kt, "_ytdlp_bin", return_value="yt-dlp"), \
+                 patch.object(kt, "resolve_spotify_metadata", return_value={
+                     "title": "Starboy",
+                     "artist": "The Weeknd",
+                     "duration_secs": 230.0,
+                     "canonical_url": "https://open.spotify.com/track/7MXVkk9YMctZqd1Srtv4MB",
+                     "item_type": "track",
+                 }), \
+                 patch.object(kt, "_run_yt", side_effect=fake_run_yt):
+                with self.assertRaises(RuntimeError) as ctx:
+                    kt.download_media(
+                        "https://open.spotify.com/track/7MXVkk9YMctZqd1Srtv4MB",
+                        out_dir,
+                        kind="audio",
+                    )
+            self.assertIn("Could not verify an exact song match", str(ctx.exception))
+            self.assertEqual(os.listdir(out_dir), [])
 
     def test_download_media_soundcloud_sets_and_shortlink_support(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -297,7 +429,7 @@ class CleanMetadataAndV4AudioTests(unittest.TestCase):
             orig_spec = os.path.join(tmp, "orig_spec.png")
             v4_spec = os.path.join(tmp, "v4_spec.png")
 
-            _make_stereo_music_wav(src_wav, duration_s=8.0, sr=48000)
+            _make_stereo_music_wav(src_wav, duration_s=10.0, sr=48000)
             subprocess.run(
                 [
                     kt._FFMPEG_BIN, "-y", "-loglevel", "error", "-i", src_wav,
@@ -338,15 +470,16 @@ class CleanMetadataAndV4AudioTests(unittest.TestCase):
             for forbidden in (b"Suno", b"Created with", b"AI Generated", b"Lavf", b"Lavc", b"Xing"):
                 self.assertNotIn(forbidden, raw_out)
 
-            # Verify spectrogram looks meaningfully transformed (ultrasonic helix + comb lanes)
-            img_orig = np.asarray(Image.open(orig_spec).convert("L"), dtype=np.float32)
-            img_v4 = np.asarray(Image.open(v4_spec).convert("L"), dtype=np.float32)
-            mean_abs_diff = float(np.mean(np.abs(img_v4 - img_orig)))
-            # Ultrasonic band (rows 15..45 from top of 280px spectrogram) has new double-helix energy
-            ultra_orig = float(img_orig[15:45, :].std())
-            ultra_v4 = float(img_v4[15:45, :].std())
-            self.assertGreater(mean_abs_diff, 4.0)
-            self.assertGreater(ultra_v4, ultra_orig + 2.0)
+            # Verify strong spectrogram transformation in BOTH upper helix (rows 40..105)
+            # AND audible mid/high weave + carved bands (rows 110..240)!
+            img_orig = np.asarray(Image.open(orig_spec).convert("RGB"), dtype=np.float32)
+            img_v4 = np.asarray(Image.open(v4_spec).convert("RGB"), dtype=np.float32)
+            upper_patch_diff = np.linalg.norm(img_v4[40:105, :, :] - img_orig[40:105, :, :], axis=-1)
+            audible_patch_diff = np.linalg.norm(img_v4[110:240, :, :] - img_orig[110:240, :, :], axis=-1)
+            self.assertGreater(float(np.mean(upper_patch_diff)), 14.0)
+            self.assertGreater(float(np.percentile(upper_patch_diff, 95)), 40.0)
+            self.assertGreater(float(np.mean(audible_patch_diff)), 7.5)
+            self.assertGreater(float(np.percentile(audible_patch_diff, 95)), 22.0)
 
 
 class PacingAndInterAudioTestingTests(unittest.TestCase):
@@ -489,6 +622,8 @@ class MonitorAnalyzeAndWhitelistDiscordTests(unittest.TestCase):
         ok_embed = followups[0]["embed"]
         self.assertEqual(ok_embed.title, "Roblox Audio Analysis")
         self.assertEqual(len(followups[0]["files"]), 2)
+        for fobj in followups[0]["files"]:
+            fobj.close()
 
     def test_whitelist_user_id_tags_user_and_delivers_verification_dm(self):
         with tempfile.TemporaryDirectory() as tmp:

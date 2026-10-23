@@ -306,79 +306,146 @@ AUTOFIT_PEAK_SLACK_DB = 1.0       # allowed above the source's own true peak
 AUTOFIT_PEAK_CAP_DB = 3.0         # cap used when the source can't be measured
 
 
-_V4_COMB_NOTCHES = (
-    (2550, 120),
-    (3700, 150),
-    (5050, 185),
-    (6650, 225),
-    (8500, 265),
-    (10600, 310),
-    (12950, 355),
-    (15550, 390),
+_V4_SCULPT_BANDS = (
+    # (valley_center_hz, valley_half_width_hz, ridge_center_hz, ridge_gain_db)
+    (1550, 200, 2150, 3.6),
+    (2950, 300, 3800, 4.6),
+    (4800, 420, 5950, 5.4),
+    (7250, 560, 8750, 5.8),
+    (10400, 700, 12200, 6.0),
 )
 
 
-def _v4_comb_gain_entry():
-    """Piecewise gain_entry for V4's zero-phase FIR sub-critical-band comb."""
-    entries = ["entry(0,0)", "entry(2050,0.4)"]
-    for center, half_w in _V4_COMB_NOTCHES:
-        entries.append(f"entry({center - half_w - 85},1.7)")
-        entries.append(f"entry({center - half_w},-65)")
-        entries.append(f"entry({center + half_w},-65)")
-        entries.append(f"entry({center + half_w + 85},1.7)")
-    entries.append("entry(17400,1.2)")
-    entries.append("entry(18250,-65)")
+def _v4_probe_gain_entry():
+    """Zero-passband probe notch curve so recognition probes see V4's spectral cuts."""
+    entries = ["entry(0,0)"]
+    for vc, vhw, _rc, _rg in _V4_SCULPT_BANDS:
+        entries.append(f"entry({vc - vhw - 90},0)")
+        entries.append(f"entry({vc - vhw},-65)")
+        entries.append(f"entry({vc + vhw},-65)")
+        entries.append(f"entry({vc + vhw + 90},0)")
+    entries.append("entry(13400,0)")
+    entries.append("entry(14200,-65)")
     entries.append("entry(24000,-65)")
     return ";".join(entries)
 
 
-def _v4_studio_af(include_comb=True):
-    """Stereo studio processing chain for Auto-Fit V4 (no tremolo warble, no mono fold)."""
-    chain = (
+def _v4_comb_gain_entry():
+    """High-contrast Blackman-Harris zero-phase FIR curve for Auto-Fit V4 export."""
+    entries = ["entry(0,0.4)", "entry(950,1.2)", "entry(1220,2.4)"]
+    for vc, vhw, rc_f, rg in _V4_SCULPT_BANDS:
+        entries.append(f"entry({vc - vhw},-95)")
+        entries.append(f"entry({vc + vhw},-95)")
+        entries.append(f"entry({rc_f - 160},{rg})")
+        entries.append(f"entry({rc_f + 160},{rg})")
+    entries.append("entry(13400,-95)")
+    entries.append("entry(24000,-95)")
+    return ";".join(entries)
+
+
+def _apply_v4_base_fx(input_path, out_wav, *, already_macro=False):
+    """Apply V4's slightly audible stereo motion + anti-fingerprint weave before API probing."""
+    try:
+        dur = max(float(_duration_seconds(input_path) or 30.0), 8.0)
+    except Exception:
+        dur = 30.0
+    fm1 = max(0.03, min(0.45, round(4.0 / dur, 5)))
+    fm2 = max(0.02, min(0.35, round(2.5 / dur, 5)))
+    fm3 = max(0.04, min(0.55, round(5.5 / dur, 5)))
+    b1 = round(900.0 / fm2, 2)
+    b2 = round(1250.0 / fm3, 2)
+    b3 = round(1550.0 / fm1, 2)
+
+    pre = (
         "aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,"
-        "allpass=f=680:t=q:w=1.1,allpass=f=2400:t=q:w=1.1,"
-        "aphaser=in_gain=0.95:out_gain=0.97:delay=1.4:decay=0.18:speed=0.25:type=triangular,"
-        "extrastereo=m=1.14,crystalizer=i=0.45,apulsator=mode=sine:hz=0.20:amount=0.04,"
-        "acompressor=threshold=-16dB:ratio=1.8:attack=25:release=220:makeup=1.0dB"
+        "vibrato=f=0.84:d=0.09,"
+        "flanger=delay=0.62:depth=0.45:regen=56:width=82:speed=0.17:"
+        "shape=sinusoidal:phase=42:interp=quadratic"
     )
-    if include_comb:
-        chain += f",firequalizer=gain_entry='{_v4_comb_gain_entry()}':zero_phase=1:accuracy=4"
-    return chain
-
-
-def _render_v4_studio_base(input_path, out_wav):
-    """Render V4's stereo studio FX base WAV via ffmpeg when Audacity isn't running."""
+    if not already_macro:
+        pre += (
+            ",aphaser=in_gain=0.88:out_gain=0.95:delay=1.8:decay=0.40:speed=0.25:type=triangular,"
+            "extrastereo=m=1.18,crystalizer=i=0.45,"
+            "acompressor=threshold=-16dB:ratio=1.8:attack=24:release=210:makeup=1.0dB"
+        )
+    p_ge = _v4_probe_gain_entry()
+    rib0 = (
+        f"min(0.065,max(0,val(0)*0.42-0.002))*("
+        f"0.12*sin(2*PI*4800*t+{b1}*sin(2*PI*{fm2}*t))"
+        f"+0.22*sin(2*PI*7800*t-{b2}*sin(2*PI*{fm3}*t))"
+        f"+0.35*sin(2*PI*11400*t+{b3}*sin(2*PI*{fm1}*t+0.6))"
+        f")"
+    )
+    rib1 = rib0.replace("val(0)", "val(1)").replace("+0.6))", "+1.5))")
+    fc = (
+        f"[0:a]{pre},asplit=2[bm][br];"
+        f"[bm]firequalizer=gain_entry='{p_ge}':zero_phase=1:wfunc=bharris:delay=0.03[bm2];"
+        f"[br]aeval='abs(val(0))|abs(val(1))',lowpass=f=1.0,lowpass=f=1.0,lowpass=f=1.0,"
+        f"aeval='{rib0}|{rib1}',highpass=f=3600[br2];"
+        f"[bm2][br2]amix=inputs=2:duration=first:dropout_transition=0:normalize=0"
+    )
+    dst_tmp = out_wav + ".v4fx.wav" if os.path.abspath(input_path) == os.path.abspath(out_wav) else out_wav
     rc, _out, err = _run(
-        _FFMPEG + ["-i", input_path, "-af", _v4_studio_af(include_comb=True)]
-        + _CLEAN_META_FLAGS + [out_wav]
+        _FFMPEG + ["-i", input_path, "-filter_complex", fc] + _CLEAN_META_FLAGS + [dst_tmp]
     )
     if rc != 0:
         raise RuntimeError("V4 studio base render failed."
                            + (f" ({err.strip()})" if err.strip() else ""))
+    if dst_tmp != out_wav:
+        os.replace(dst_tmp, out_wav)
     return out_wav
 
 
+def _render_v4_studio_base(input_path, out_wav):
+    """Render V4's stereo studio FX + spectral base WAV when Audacity isn't running."""
+    return _apply_v4_base_fx(input_path, out_wav, already_macro=False)
+
+
 def _v4_sculpt_filter_complex(gain_db, clip_threshold, duration_secs):
-    """Build V4's loudness + zero-phase spectral lattice + ultrasonic double-helix graph."""
+    """Build V4's high-contrast spectral sculpt + slightly audible twin-rail weave graph."""
     dur = max(float(duration_secs or 30.0), 8.0)
-    fm = max(0.025, min(0.45, 9.0 / dur))
-    beta = round(750.0 / fm, 2)
+    fm1 = max(0.03, min(0.45, round(4.0 / dur, 5)))
+    fm2 = max(0.02, min(0.35, round(2.5 / dur, 5)))
+    fm3 = max(0.04, min(0.55, round(5.5 / dur, 5)))
+    b1 = round(900.0 / fm2, 2)
+    b2 = round(1250.0 / fm3, 2)
+    b3 = round(1550.0 / fm1, 2)
+    b4 = round(2300.0 / fm1, 2)
+    b5 = round(1700.0 / fm2, 2)
+
+    # Rectified + 4x 0.8 Hz lowpass envelope keeps zero bass AM sideband haze while gating silence.
+    env_gate = "min(0.145,max(0,val(0)*0.82-0.003))"
     rib_ch0 = (
-        f"(0.32*min(0.22,abs(val(0))))*("
-        f"sin(2*PI*19700*t+{beta}*sin(2*PI*{fm:.5f}*t))"
-        f"+0.95*sin(2*PI*19700*t-{beta}*sin(2*PI*{fm:.5f}*t)))"
+        f"{env_gate}*("
+        f"0.075*sin(2*PI*4800*t+{b1}*sin(2*PI*{fm2}*t))"
+        f"+0.070*sin(2*PI*5020*t+{b1}*sin(2*PI*{fm2}*t))"
+        f"+0.18*sin(2*PI*7800*t-{b2}*sin(2*PI*{fm3}*t))"
+        f"+0.16*sin(2*PI*8040*t-{b2}*sin(2*PI*{fm3}*t))"
+        f"+0.38*sin(2*PI*11400*t+{b3}*sin(2*PI*{fm1}*t+0.6))"
+        f"+0.35*sin(2*PI*11660*t-{b3}*sin(2*PI*{fm1}*t+2.0))"
+        f"+0.82*sin(2*PI*16800*t+{b4}*sin(2*PI*{fm1}*t))"
+        f"+0.76*sin(2*PI*17080*t+{b4}*sin(2*PI*{fm1}*t))"
+        f"+0.78*sin(2*PI*16800*t-{b4}*sin(2*PI*{fm1}*t))"
+        f"+0.74*sin(2*PI*17080*t-{b4}*sin(2*PI*{fm1}*t))"
+        f"+0.68*sin(2*PI*18400*t+{b5}*cos(2*PI*{fm2}*t))"
+        f")"
     )
-    rib_ch1 = rib_ch0.replace("val(0)", "val(1)")
+    rib_ch1 = rib_ch0.replace("val(0)", "val(1)").replace("+0.6))", "+1.5))")
     gain_entry = _v4_comb_gain_entry()
+    # Softclip runs BEFORE Blackman-Harris firequalizer so distortion never refills carved notches.
     return (
         f"[0:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,asplit=2[s_main][s_rib];"
         f"[s_main]volume={gain_db:.2f}dB,"
+        f"flanger=delay=0.48:depth=0.36:regen=48:width=76:speed=0.22:"
+        f"shape=sinusoidal:phase=38:interp=quadratic,"
         f"asoftclip=type=atan:oversample=4:threshold={clip_threshold},"
-        f"firequalizer=gain_entry='{gain_entry}':zero_phase=1:accuracy=4[main];"
-        f"[s_rib]lowpass=f=20,aeval='{rib_ch0}|{rib_ch1}',"
-        f"highpass=f=18850,highpass=f=18850,highpass=f=18850[rib];"
-        f"[main][rib]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,"
-        f"alimiter=limit=0.89:level=0:attack=3:release=40"
+        f"volume=0.78,"
+        f"firequalizer=gain_entry='{gain_entry}':zero_phase=1:wfunc=bharris:delay=0.04[main];"
+        f"[s_rib]aeval='abs(val(0))|abs(val(1))',"
+        f"lowpass=f=0.8,lowpass=f=0.8,lowpass=f=0.8,lowpass=f=0.8,"
+        f"aeval='{rib_ch0}|{rib_ch1}',"
+        f"highpass=f=3600,highpass=f=3600[rib];"
+        f"[main][rib]amix=inputs=2:duration=first:dropout_transition=0:normalize=0"
     )
 
 
@@ -407,7 +474,7 @@ def _match_loudness(work_wav, output_path, source_path, progress=None, *, v4_scu
             cmd = (
                 _FFMPEG + ["-i", work_wav, "-filter_complex", fc]
                 + _CLEAN_MP3_FLAGS
-                + ["-c:a", "libmp3lame", "-b:a", "256k", "-cutoff", "21000", dst]
+                + ["-c:a", "libmp3lame", "-b:a", "320k", "-cutoff", "21500", dst]
             )
         else:
             af = (f"volume={gain_db:.2f}dB,asoftclip=type=atan:oversample=4"
@@ -1830,12 +1897,17 @@ def _copyr8_autofit_macro_search(input_path, output_path, spectrogram_path,
             if progress:
                 progress(macro_info["reason"])
 
-        if is_v4 and not macro_info["applied"]:
+        if is_v4:
             try:
-                _render_v4_studio_base(input_path, base_wav)
+                _apply_v4_base_fx(
+                    base_path,
+                    base_wav,
+                    already_macro=macro_info["applied"],
+                )
                 base_path = base_wav
             except Exception:
-                base_path = input_path
+                if not os.path.isfile(base_path):
+                    base_path = input_path
 
         # Stage 2: only a MACRO-PROCESSED base may ship at 0.0 st / 1.00x.
         ok, counts = False, None
@@ -2645,14 +2717,321 @@ def _format_duration_display(raw_dur):
     return s
 
 
+_VARIANT_PATTERNS = {
+    "remix": re.compile(r"\b(?:remix(?:ed)?|rework|bootleg|vip\s+mix)\b", re.IGNORECASE),
+    "slowed": re.compile(r"\bslowed\b", re.IGNORECASE),
+    "reverb": re.compile(r"\breverb\b", re.IGNORECASE),
+    "sped_up": re.compile(r"\b(?:sped\s*up|speed\s*up|nightcore)\b", re.IGNORECASE),
+    "daycore": re.compile(r"\b(?:daycore|chopped|screwed)\b", re.IGNORECASE),
+    "8d": re.compile(r"\b(?:8d|16d|3d\s+audio)\b", re.IGNORECASE),
+    "bass_boost": re.compile(r"\bbass\s*boost(?:ed)?\b", re.IGNORECASE),
+    "instrumental": re.compile(r"\b(?:instrumental|karaoke|backing\s+track)\b", re.IGNORECASE),
+    "acapella": re.compile(r"\b(?:a\s*capp?ella|vocals?\s+only)\b", re.IGNORECASE),
+    "cover": re.compile(r"\b(?:cover(?:ed)?|tribute|parody)\b", re.IGNORECASE),
+    "live": re.compile(r"\b(?:live|concert)\b", re.IGNORECASE),
+    "acoustic": re.compile(
+        r"\b(?:acoustic|unplugged|piano\s+version|guitar\s+version)\b", re.IGNORECASE
+    ),
+    "lofi": re.compile(r"\blo[\s-]*fi\b", re.IGNORECASE),
+    "mashup": re.compile(r"\b(?:mashup|medley)\b", re.IGNORECASE),
+    "demo": re.compile(r"\bdemo\b", re.IGNORECASE),
+    "preview": re.compile(r"\b(?:preview|snippet|teaser)\b", re.IGNORECASE),
+}
+
+_DISQUALIFY_TITLE_RE = re.compile(
+    r"\b(?:full\s+album|album\s+stream|\d+\s*hours?|hour\s+loop|compilation|megamix|"
+    r"reaction|tutorial|guitar\s+lesson|piano\s+tutorial|how\s+to\s+play|type\s+beat)\b",
+    re.IGNORECASE,
+)
+
+_BENIGN_MEDIA_TAGS_RE = re.compile(
+    r"[\(\[\{]\s*(?:"
+    r"official(?:\s+(?:music\s+)?video|\s+audio|\s+lyric(?:\s+video)?|\s+visualizer)?|"
+    r"music\s+video|lyric(?:s|\s+video)?|visualizer|audio(?:\s+only)?|video|"
+    r"hd|hq|4k|explicit|clean(?:\s+version)?|dirty|original\s+mix|"
+    r"album\s+version|single\s+version|(?:\d{4}\s+)?remaster(?:ed)?(?:\s+\d{4})?"
+    r")\s*[\)\]\}]"
+    r"|(?:\s+[-–—]\s+|\s+)(?:\d{4}\s+)?remaster(?:ed)?(?:\s+\d{4})?\b",
+    re.IGNORECASE,
+)
+
+_FEAT_STRIP_RE = re.compile(
+    r"[\(\[\{]\s*(?:feat\.?|ft\.?|featuring|with)\s+[^\)\]\}]+[\)\]\}]"
+    r"|\s+(?:feat\.?|ft\.?|featuring)\s+.+$",
+    re.IGNORECASE,
+)
+
+
+def _fold_ascii(text):
+    """Case-fold and strip accents/punctuation for reliable song/artist comparison."""
+    import unicodedata  # noqa: PLC0415
+
+    s = unicodedata.normalize("NFKD", str(text or ""))
+    s = "".join(ch for ch in s if not unicodedata.combining(ch)).lower()
+    s = s.replace("&", " and ").replace("'", "").replace("\u2019", "")
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _clean_channel_artist(name):
+    """Normalize a channel/uploader name by stripping platform suffixes (- Topic, VEVO, Official)."""
+    raw = str(name or "").strip()
+    raw = re.sub(r"\s*-\s*topic\s*$", "", raw, flags=re.IGNORECASE)
+    norm = _fold_ascii(raw)
+    compact = norm.replace(" ", "")
+    for suf in ("officialmusic", "officialchannel", "vevo", "official", "music", "records", "tv"):
+        if len(compact) > len(suf) + 2 and compact.endswith(suf):
+            compact = compact[: -len(suf)]
+            break
+    return norm, compact
+
+
+def _variant_counts(text):
+    """Count occurrences of each version/edit keyword in `text`."""
+    s = str(text or "")
+    out = {}
+    for key, pat in _VARIANT_PATTERNS.items():
+        n = len(pat.findall(s))
+        if n:
+            out[key] = n
+    return out
+
+
+def _clean_core_song_title(raw_title):
+    """Strip benign video/remaster tags and feat. credits while preserving song words."""
+    s = str(raw_title or "").strip()
+    for _ in range(3):
+        s2 = _BENIGN_MEDIA_TAGS_RE.sub(" ", s)
+        s2 = _FEAT_STRIP_RE.sub(" ", s2)
+        if s2 == s:
+            break
+        s = s2
+    return _fold_ascii(s)
+
+
+def _split_expected_artists(exp_artist):
+    """Split an artist credit string into normalized individual artist names."""
+    raw = str(exp_artist or "").strip()
+    if not raw:
+        return []
+    parts = re.split(
+        r"\s*(?:,|&|/|\bfeat\.?|\bft\.?|\bfeaturing\b|\bwith\b|\bx\b)\s*",
+        raw,
+        flags=re.IGNORECASE,
+    )
+    out = []
+    for p in parts:
+        folded = _fold_ascii(p)
+        if folded and folded not in out:
+            out.append(folded)
+    return out
+
+
+def verify_song_candidate(cand, exp_title, exp_artist, exp_duration_secs=None, kind="audio"):
+    """Verify whether a yt-dlp candidate dict is actually the exact requested song.
+
+    Returns `(verified: bool, score: float, reason: str)`. Rejects wrong songs by
+    the same artist, covers/same-title tracks by other artists, remixes, slowed/reverb,
+    nightcore/sped-up, instrumentals, live versions, compilations, 30s previews,
+    and duration mismatches.
+    """
+    if not isinstance(cand, dict):
+        return False, 0.0, "invalid candidate"
+    if cand.get("is_live") or cand.get("live_status") in ("is_live", "is_upcoming"):
+        return False, 0.0, "live stream"
+
+    cand_title = str(cand.get("title") or "").strip()
+    cand_track = str(cand.get("track") or "").strip()
+    if not cand_title and not cand_track:
+        return False, 0.0, "missing candidate title"
+
+    # 1. Reject compilations / hour loops / tutorials / reactions unless requested
+    if _DISQUALIFY_TITLE_RE.search(cand_title) and not _DISQUALIFY_TITLE_RE.search(exp_title or ""):
+        return False, 0.0, "disqualified compilation/non-song upload"
+
+    # 2. Strict variant symmetry: candidate must have the exact same remix/slowed/live/cover/etc. profile
+    exp_vars = _variant_counts(exp_title)
+    cand_vars = _variant_counts(cand_title)
+    if cand_vars != exp_vars:
+        # Also check `track` metadata only when `cand_title` failed solely due to channel suffix
+        if not (cand_track and _variant_counts(cand_track) == exp_vars and not cand_vars):
+            return False, 0.0, f"version mismatch ({cand_vars} vs {exp_vars})"
+
+    # 3. Preview / duration verification
+    cand_url = str(cand.get("webpage_url") or cand.get("url") or "")
+    fmt_id = str(cand.get("format_id") or "").lower()
+    if "preview" in fmt_id or "/preview/" in cand_url.lower():
+        return False, 0.0, "preview stream"
+
+    raw_dur = cand.get("duration")
+    cand_dur = None
+    if raw_dur is not None:
+        try:
+            cand_dur = float(raw_dur)
+        except (TypeError, ValueError):
+            cand_dur = None
+
+    if cand_dur is not None and cand_dur > 0:
+        if 27.5 <= cand_dur <= 31.5 and (exp_duration_secs is None or exp_duration_secs > 38.0):
+            return False, 0.0, "30-second preview stub"
+        if exp_duration_secs and exp_duration_secs > 0:
+            max_tol = 12.0 if kind == "audio" else 20.0
+            if abs(cand_dur - float(exp_duration_secs)) > max_tol:
+                return (
+                    False,
+                    0.0,
+                    f"duration mismatch ({cand_dur:.0f}s vs expected {float(exp_duration_secs):.0f}s)",
+                )
+
+    # 4. Artist verification (mandatory so same-title songs/covers by other artists never pass)
+    exp_artists = _split_expected_artists(exp_artist)
+    if not exp_artists:
+        return False, 0.0, "missing expected artist"
+    primary_artist = exp_artists[0]
+    primary_compact = primary_artist.replace(" ", "")
+
+    cand_artist_meta = " ".join(
+        str(cand.get(k) or "")
+        for k in ("artist", "creator")
+    )
+    if isinstance(cand.get("artists"), list):
+        cand_artist_meta += " " + " ".join(str(x) for x in cand["artists"] if x)
+    cand_artist_fold = _fold_ascii(cand_artist_meta)
+
+    uploader_raw = str(cand.get("channel") or cand.get("uploader") or "").strip()
+    up_fold, up_compact = _clean_channel_artist(uploader_raw)
+    is_topic = bool(
+        re.search(r"-\s*topic\s*$", uploader_raw, re.IGNORECASE)
+        or "provided to youtube by" in str(cand.get("description") or "").lower()
+    )
+
+    def _artist_in(haystack_fold, haystack_compact=""):
+        if not haystack_fold and not haystack_compact:
+            return False
+        if re.search(rf"(?:^|\s){re.escape(primary_artist)}(?:$|\s)", haystack_fold):
+            return True
+        if len(primary_compact) >= 4 and haystack_compact:
+            if primary_compact == haystack_compact or haystack_compact.startswith(primary_compact):
+                return True
+        return False
+
+    meta_artist_ok = _artist_in(cand_artist_fold, cand_artist_fold.replace(" ", ""))
+    channel_artist_ok = _artist_in(up_fold, up_compact)
+    desc_fold = _fold_ascii(str(cand.get("description") or "")[:600])
+    topic_desc_ok = is_topic and _artist_in(desc_fold)
+    title_fold_full = _fold_ascii(cand_title)
+    title_artist_ok = _artist_in(title_fold_full)
+
+    trusted_source = bool(meta_artist_ok or channel_artist_ok or topic_desc_ok)
+    if not (trusted_source or title_artist_ok):
+        return False, 0.0, "artist mismatch"
+
+    # 5. Exact Core Song Title verification (no prefix traps, no extra song words)
+    exp_core = _clean_core_song_title(exp_title)
+    if not exp_core:
+        return False, 0.0, "empty expected title"
+
+    title_matched = False
+    if cand_track and _clean_core_song_title(cand_track) == exp_core:
+        title_matched = True
+
+    if not title_matched:
+        # Check full cleaned title and "Artist - Title" / "Title - Artist" halves
+        segments = [cand_title]
+        for sep in (" - ", " – ", " — ", ": ", " | "):
+            if sep in cand_title:
+                left, right = cand_title.split(sep, 1)
+                segments.extend([right, left])
+        for seg in segments:
+            cleaned_seg = _clean_core_song_title(seg)
+            if cleaned_seg == exp_core:
+                title_matched = True
+                break
+            # Strip leading/trailing expected artist names if attached without dash
+            trimmed = cleaned_seg
+            for art in exp_artists:
+                trimmed = re.sub(rf"^(?:{re.escape(art)}\s+)+", "", trimmed).strip()
+                trimmed = re.sub(rf"(?:\s+by\s+{re.escape(art)}|\s+{re.escape(art)})$", "", trimmed).strip()
+            if trimmed == exp_core:
+                title_matched = True
+                break
+
+    if not title_matched:
+        return False, 0.0, "song title mismatch"
+
+    # Third-party reuploads (not artist channel / Topic / track metadata) require
+    # explicit artist in title AND tight <= 5s duration confirmation.
+    if not trusted_source:
+        if exp_duration_secs is None or cand_dur is None:
+            return False, 0.0, "untrusted uploader without duration confirmation"
+        if abs(cand_dur - float(exp_duration_secs)) > 5.0:
+            return False, 0.0, "untrusted uploader duration drift"
+
+    # 6. Rank verified candidates so Official Audio / Topic with exact duration wins
+    score = 100.0
+    if is_topic or meta_artist_ok:
+        score += 45.0
+    if channel_artist_ok:
+        score += 30.0
+    if re.search(r"\bofficial\s+audio\b", cand_title, re.IGNORECASE):
+        score += 20.0
+    elif re.search(r"\b(?:lyric|audio)\b", cand_title, re.IGNORECASE):
+        score += 8.0
+    if exp_duration_secs and cand_dur:
+        diff = abs(cand_dur - float(exp_duration_secs))
+        score += max(0.0, 36.0 - 3.0 * diff)
+    return True, round(score, 2), "verified"
+
+
+def _probe_verified_search_candidates(
+    ytdlp, search_spec, exp_title, exp_artist, exp_duration_secs, kind, extra_flags, timeout=75
+):
+    """Probe search results via `--dump-json` and return verified candidates best-first."""
+    cmd = (
+        [ytdlp, "--no-warnings", "--skip-download", "--dump-json"]
+        + list(extra_flags)
+        + [search_spec]
+    )
+    rc, out, _err = _run_yt(cmd, timeout=timeout)
+    if rc != 0 and not (out or "").strip():
+        return []
+    verified = []
+    seen_urls = set()
+    for line in (out or "").splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            cand = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        cand_url = str(cand.get("webpage_url") or cand.get("original_url") or cand.get("url") or "").strip()
+        if not cand_url.startswith(("http://", "https://")) or cand_url in seen_urls:
+            continue
+        ok, score, _reason = verify_song_candidate(
+            cand, exp_title, exp_artist, exp_duration_secs=exp_duration_secs, kind=kind
+        )
+        if ok:
+            seen_urls.add(cand_url)
+            verified.append({
+                "url": cand_url,
+                "title": str(cand.get("title") or exp_title),
+                "uploader": str(cand.get("channel") or cand.get("uploader") or exp_artist),
+                "duration": cand.get("duration"),
+                "score": score,
+                "is_youtube": "youtube.com" in cand_url.lower() or "youtu.be" in cand_url.lower(),
+            })
+    verified.sort(key=lambda item: item["score"], reverse=True)
+    return verified
+
+
 def download_media(url, out_dir, kind="audio", max_bytes=_DISCORD_MAX_BYTES):
     """Download playable audio/video for a URL (including Spotify & SoundCloud) via yt-dlp.
 
     Spotify streams use Widevine DRM and are never decrypted or ripped; instead,
-    Spotify links resolve public track/artist metadata and fetch matching playable
-    audio via yt-dlp search (YouTube / SoundCloud fallback). SoundCloud short links,
-    mobile links, tracks, and sets are normalized and downloaded with SoundCloud-safe
-    format selection.
+    Spotify links resolve public track/artist metadata, strictly verify search
+    candidates against artist + exact song title + variant profile + duration,
+    and refuse to download if no exact match can be confirmed.
     """
     ytdlp = _ytdlp_bin()
     norm_url = _normalize_download_url(url)
@@ -2706,71 +3085,94 @@ def download_media(url, out_dir, kind="audio", max_bytes=_DISCORD_MAX_BYTES):
             "note": note.strip(),
         }
 
-    # ---- Branch 1: Spotify link -> metadata lookup + yt-dlp search -----------
-    if _is_spotify_url(norm_url):
-        meta = resolve_spotify_metadata(norm_url)
-        sp_title = meta["title"]
-        sp_artist = meta.get("artist") or ""
-        sp_dur = meta.get("duration_secs")
-        display_title = f"{sp_artist} - {sp_title}" if sp_artist else sp_title
-        base_query = f"{sp_artist} - {sp_title}".strip(" -") if sp_artist else sp_title
-
-        search_targets = []
-        if kind == "audio":
-            if sp_dur and sp_dur >= 25:
-                lo = max(15, int(sp_dur - 45))
-                hi = int(sp_dur + 90)
-                search_targets.append((
-                    f"ytsearch3:{base_query} official audio",
-                    ["--playlist-items", "1:3", "--max-downloads", "1",
-                     "--match-filter", f"duration >= {lo} & duration <= {hi}"],
-                    True,
-                ))
-            search_targets.append((f"ytsearch1:{base_query} audio", ["--no-playlist"], True))
-            search_targets.append((f"scsearch1:{base_query}", ["--no-playlist"], False))
-        else:
-            search_targets.append((f"ytsearch1:{base_query}", ["--no-playlist"], True))
-
-        last_err = ""
-        for target, extra_flags, is_yt in search_targets:
+    def _download_verified_candidates(candidates, exp_dur):
+        """Download the first verified candidate whose actual file passes duration checks."""
+        max_tol = 12.0 if kind == "audio" else 20.0
+        for cand in candidates:
             _clear_partial_downloads(out_dir)
-            cmd = [ytdlp, "--no-warnings", "--no-embed-metadata"] + extra_flags
-            if is_yt:
+            cmd = [ytdlp, "--no-warnings", "--no-playlist", "--no-embed-metadata"]
+            if cand.get("is_youtube"):
                 cmd += ["--extractor-args", "youtube:player_client=android,web_embedded"]
             cmd += cookies + ffmpeg_loc
             if kind == "audio":
+                if not cand.get("is_youtube") and _is_soundcloud_url(cand["url"]):
+                    cmd += ["-f", "http_mp3_1_0/hls_mp3_1_0/bestaudio/best"]
                 dl = cmd + ["-x", "--audio-format", "mp3", "--audio-quality", "0",
-                            "-o", out_tmpl, target]
+                            "-o", out_tmpl, cand["url"]]
             else:
-                dl = cmd + ["-f", "bv*[height<=720]+ba/b[height<=720]",
-                            "--merge-output-format", "mp4", "-o", out_tmpl, target]
-            rc, _out, err = _run_yt(dl, timeout=240)
-            # Note: --max-downloads 1 exits with code 101 in yt-dlp after writing the file!
-            if rc not in (0, 101):
-                rc, _out, err = _run_yt(dl + relaxed, timeout=240)
+                dl = cmd + ["-f", "bv*[height<=720]+ba/b[height<=720]/best",
+                            "--merge-output-format", "mp4", "-o", out_tmpl, cand["url"]]
+            rc, _out, _err = _run_yt(dl, timeout=240)
+            if rc != 0:
+                rc, _out, _err = _run_yt(dl + relaxed, timeout=240)
+            if rc != 0:
+                continue
             try:
-                if os.path.isfile(_find_output(out_dir)):
-                    actual_dur = sp_dur
-                    if not actual_dur:
-                        try:
-                            actual_dur = _duration_seconds(_find_output(out_dir))
-                        except Exception:
-                            actual_dur = None
-                    return _finalize_result(
-                        display_title,
-                        actual_dur,
-                        sp_artist or "Spotify",
-                        meta.get("canonical_url") or norm_url,
-                    )
+                out_file = _find_output(out_dir)
             except RuntimeError:
-                pass
-            last_err = err or last_err
+                continue
+            try:
+                got_dur = _duration_seconds(out_file)
+            except Exception:
+                got_dur = None
+            if got_dur is not None and got_dur > 0:
+                if 27.5 <= got_dur <= 31.5 and (exp_dur is None or float(exp_dur) > 38.0):
+                    _clear_partial_downloads(out_dir)
+                    continue
+                if exp_dur and float(exp_dur) > 0 and abs(got_dur - float(exp_dur)) > max_tol:
+                    _clear_partial_downloads(out_dir)
+                    continue
+            return out_file, (got_dur or cand.get("duration") or exp_dur)
+        _clear_partial_downloads(out_dir)
+        return None, None
 
-        hint = _err_hint(last_err)
+    # ---- Branch 1: Spotify link -> metadata lookup + verified search ---------
+    if _is_spotify_url(norm_url):
+        meta = resolve_spotify_metadata(norm_url)
+        sp_title = (meta.get("title") or "").strip()
+        sp_artist = (meta.get("artist") or "").strip()
+        sp_dur = meta.get("duration_secs")
+        display_title = f"{sp_artist} - {sp_title}" if sp_artist else sp_title
+        if not sp_title or not sp_artist:
+            raise RuntimeError(
+                "Could not confirm both the artist and song title from that Spotify link. "
+                "Download cancelled so the wrong song is never sent."
+            )
+
+        base_query = f"{sp_artist} - {sp_title}"
+        yt_flags = ["--extractor-args", "youtube:player_client=android,web_embedded"] + cookies
+        sc_flags = list(cookies)
+
+        search_specs = []
+        if kind == "audio":
+            search_specs.append((f"ytsearch5:{base_query} official audio", yt_flags))
+            search_specs.append((f"scsearch5:{base_query}", sc_flags))
+        else:
+            search_specs.append((f"ytsearch5:{base_query}", yt_flags))
+
+        for spec, s_flags in search_specs:
+            verified_cands = _probe_verified_search_candidates(
+                ytdlp, spec, sp_title, sp_artist, sp_dur, kind, s_flags
+            )
+            if not verified_cands:
+                verified_cands = _probe_verified_search_candidates(
+                    ytdlp, spec, sp_title, sp_artist, sp_dur, kind, s_flags + relaxed
+                )
+            if not verified_cands:
+                continue
+            matched_file, actual_dur = _download_verified_candidates(verified_cands, sp_dur)
+            if matched_file and os.path.isfile(matched_file):
+                return _finalize_result(
+                    display_title,
+                    actual_dur or sp_dur,
+                    sp_artist,
+                    meta.get("canonical_url") or norm_url,
+                )
+
+        _clear_partial_downloads(out_dir)
         raise RuntimeError(
-            f"Could not download playable audio for Spotify track '{display_title}'."
-            + (f" {last_err.strip()}" if last_err.strip() else "")
-            + (f"\n{hint}" if hint else "")
+            f"Could not verify an exact song match for '{display_title}'. "
+            "Download cancelled because only confirmed matching tracks are downloaded."
         )
 
     # ---- Branch 2: SoundCloud link -------------------------------------------
@@ -2791,7 +3193,13 @@ def download_media(url, out_dir, kind="audio", max_bytes=_DISCORD_MAX_BYTES):
             )
         first_line = (out.strip().splitlines() or [""])[0]
         parts = (first_line.split("\t") + ["", "", ""])[:3]
-        title, duration, uploader = parts[0], parts[1], parts[2]
+        title, duration, uploader = parts[0].strip(), parts[1].strip(), parts[2].strip()
+        exp_sc_dur = None
+        try:
+            if duration and duration.upper() != "NA":
+                exp_sc_dur = float(duration)
+        except (TypeError, ValueError):
+            exp_sc_dur = None
 
         if rc == 0:
             _clear_partial_downloads(out_dir)
@@ -2811,66 +3219,53 @@ def download_media(url, out_dir, kind="audio", max_bytes=_DISCORD_MAX_BYTES):
                 dl_rc, _dl_out, dl_err = _run_yt(dl + relaxed, timeout=240)
             err = dl_err or err
             if dl_rc == 0:
-                # Guard against 30s SoundCloud Go+ preview stubs when full track is on YT
                 out_file = _find_output(out_dir)
                 try:
                     got_dur = _duration_seconds(out_file)
                 except Exception:
                     got_dur = 0.0
-                if not (kind == "audio" and 28.0 <= got_dur <= 31.0 and title):
-                    return _finalize_result(title, duration or got_dur, uploader, norm_url)
-                # Try finding the full non-preview track if SoundCloud only served a 30s Go+ snippet
-                if title:
-                    fb_dir = os.path.join(out_dir, "_sc_full")
-                    os.makedirs(fb_dir, exist_ok=True)
-                    fb_tmpl = os.path.join(fb_dir, "download.%(ext)s")
-                    q = f"{uploader} - {title}".strip(" -") if uploader else title
-                    fb_cmd = (
-                        [ytdlp, "--no-warnings", "--no-playlist", "--no-embed-metadata",
-                         "--extractor-args", "youtube:player_client=android,web_embedded",
-                         "--match-filter", "duration >= 45"]
-                        + cookies + ffmpeg_loc
-                        + ["-x", "--audio-format", "mp3", "--audio-quality", "0",
-                           "-o", fb_tmpl, f"ytsearch1:{q} official audio"]
+                is_preview_stub = (
+                    kind == "audio"
+                    and 27.5 <= got_dur <= 31.5
+                    and (exp_sc_dur is None or exp_sc_dur > 38.0)
+                )
+                if not is_preview_stub:
+                    return _finalize_result(title, exp_sc_dur or got_dur, uploader, norm_url)
+
+                # Never ship a 30s Go+ preview stub; only replace with a strictly verified full track
+                _clear_partial_downloads(out_dir)
+                if title and uploader:
+                    yt_flags = ["--extractor-args", "youtube:player_client=android,web_embedded"] + cookies
+                    target_dur = exp_sc_dur if (exp_sc_dur and exp_sc_dur > 38.0) else None
+                    cands = _probe_verified_search_candidates(
+                        ytdlp, f"ytsearch5:{uploader} - {title} official audio",
+                        title, uploader, target_dur, kind, yt_flags,
                     )
-                    fb_rc, _, _ = _run_yt(fb_cmd, timeout=180)
-                    if fb_rc == 0:
-                        try:
-                            full_file = _find_output(fb_dir)
-                            full_dur = _duration_seconds(full_file)
-                            os.replace(full_file, out_file)
-                            return _finalize_result(title, full_dur, uploader, norm_url)
-                        except Exception:
-                            pass
-                return _finalize_result(title, duration or got_dur, uploader, norm_url)
+                    if target_dur is None:
+                        cands = [c for c in cands if (c.get("duration") or 0) >= 45]
+                    matched_file, actual_dur = _download_verified_candidates(cands, target_dur)
+                    if matched_file and os.path.isfile(matched_file):
+                        return _finalize_result(title, actual_dur, uploader, norm_url)
+                raise RuntimeError(
+                    f"SoundCloud only provided a 30-second preview for '{title or 'this track'}', "
+                    "and no verified full match could be confirmed. Download cancelled."
+                )
 
-        # Fallback if SoundCloud blocked/geo-gated the track but we resolved or can infer title
-        slug_query = f"{uploader} - {title}".strip(" -") if title else ""
-        if not slug_query:
-            segs = [seg for seg in (parsed_sc.path or "").split("/") if seg and seg != "sets"]
-            if len(segs) >= 2:
-                slug_query = f"{segs[0].replace('-', ' ')} - {segs[-1].replace('-', ' ')}"
-        if slug_query and kind == "audio":
-            _clear_partial_downloads(out_dir)
-            fb_cmd = (
-                [ytdlp, "--no-warnings", "--no-playlist", "--no-embed-metadata",
-                 "--extractor-args", "youtube:player_client=android,web_embedded"]
-                + cookies + ffmpeg_loc
-                + ["-x", "--audio-format", "mp3", "--audio-quality", "0",
-                   "-o", out_tmpl, f"ytsearch1:{slug_query} audio"]
+        # Fallback when SoundCloud geo-blocks direct stream ONLY if real title + uploader were resolved
+        if title and uploader and kind == "audio":
+            yt_flags = ["--extractor-args", "youtube:player_client=android,web_embedded"] + cookies
+            cands = _probe_verified_search_candidates(
+                ytdlp, f"ytsearch5:{uploader} - {title} official audio",
+                title, uploader, exp_sc_dur, kind, yt_flags,
             )
-            fb_rc, _, _ = _run_yt(fb_cmd, timeout=200)
-            if fb_rc == 0:
-                try:
-                    out_file = _find_output(out_dir)
-                    fb_dur = _duration_seconds(out_file)
-                    return _finalize_result(title or slug_query, fb_dur, uploader or "SoundCloud", norm_url)
-                except Exception:
-                    pass
+            matched_file, actual_dur = _download_verified_candidates(cands, exp_sc_dur)
+            if matched_file and os.path.isfile(matched_file):
+                return _finalize_result(title, actual_dur or exp_sc_dur, uploader, norm_url)
 
+        _clear_partial_downloads(out_dir)
         hint = _err_hint(err)
         raise RuntimeError(
-            "yt-dlp could not download that SoundCloud link."
+            "Could not download a verified full copy of that SoundCloud track."
             + (f" {err.strip()}" if (err or "").strip() else "")
             + (f"\n{hint}" if hint else "")
         )
@@ -2896,6 +3291,12 @@ def download_media(url, out_dir, kind="audio", max_bytes=_DISCORD_MAX_BYTES):
                            + (f"\n{hint}" if hint else ""))
     parts = (out.strip().split("\t") + ["", "", ""])[:3]
     title, duration, uploader = parts[0], parts[1], parts[2]
+    exp_direct_dur = None
+    try:
+        if duration and duration.strip().upper() != "NA":
+            exp_direct_dur = float(duration)
+    except (TypeError, ValueError):
+        exp_direct_dur = None
 
     _clear_partial_downloads(out_dir)
     if kind == "audio":
@@ -2912,6 +3313,19 @@ def download_media(url, out_dir, kind="audio", max_bytes=_DISCORD_MAX_BYTES):
         raise RuntimeError("yt-dlp download failed."
                            + (f" {err.strip()}" if err.strip() else "")
                            + (f"\n{hint}" if hint else ""))
+
+    if exp_direct_dur and exp_direct_dur > 38.0:
+        try:
+            got_dur = _duration_seconds(_find_output(out_dir))
+            if got_dur and abs(got_dur - exp_direct_dur) > 15.0:
+                _clear_partial_downloads(out_dir)
+                raise RuntimeError(
+                    "Downloaded stream duration did not match the linked track; download cancelled."
+                )
+        except RuntimeError:
+            raise
+        except Exception:
+            pass
 
     return _finalize_result(title, duration, uploader, norm_url)
 

@@ -58,6 +58,7 @@ class BundledMacroTests(unittest.TestCase):
             "NotchFilter",
             "NotchFilter",
             "NotchFilter",
+            "NotchFilter",
             "BassAndTreble",
             "Compressor",
             "Limiter",
@@ -68,10 +69,11 @@ class BundledMacroTests(unittest.TestCase):
         self.assertEqual(
             [params for name, params in steps if name == "NotchFilter"],
             [
-                'frequency="2550" q="10"',
-                'frequency="5050" q="10"',
-                'frequency="8500" q="10"',
-                'frequency="12950" q="10"',
+                'frequency="1550" q="4.5"',
+                'frequency="2950" q="4.5"',
+                'frequency="4800" q="4.5"',
+                'frequency="7250" q="4.5"',
+                'frequency="10400" q="4.5"',
             ],
         )
 
@@ -97,7 +99,7 @@ class BundledMacroTests(unittest.TestCase):
                 result = processor.run_macro_blocking(
                     "input.wav", str(output), str(processor.BUNDLED_V4_MACRO))
                 drop.assert_called_once_with()
-                self.assertEqual(len(result["steps"]), 11)
+                self.assertEqual(len(result["steps"]), 12)
                 self.assertTrue(result["metadata"])
                 session.apply_macro_to_file.assert_called_once_with(
                     "input.wav", str(output), parse_macro(processor.BUNDLED_V4_MACRO),
