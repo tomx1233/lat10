@@ -1,0 +1,17 @@
+SelectAll:
+StereoToMono:Use_Preset="<Factory Defaults>"
+Duplicate:
+SelectTracks:Mode="Set" Track="1" TrackCount="1"
+PanRight:
+SelectTracks:Mode="Set" Track="0" TrackCount="1"
+PanLeft:
+SelectTracks:Mode="Set" Track="1" TrackCount="1"
+Tremolo:lfo="4" phase="60" wave="Sine" wet="50"
+SelectTracks:Mode="Set" Track="1" TrackCount="1"
+Tremolo:lfo="4" phase="0" wave="Sine" wet="40"
+SelectAll:
+MixAndRender:
+SelectAll:
+Sc1:Attack_time_(ms)="400" Knee_radius_(dB)="2" Makeup_gain_(dB)="5" Ratio_(1_n)="10" Release_time_(ms)="800" Threshold_level_(dB)="-15"
+SelectAll:
+Sc1:Attack_time_(ms)="400" Knee_radius_(dB)="2" Makeup_gain_(dB)="5" Ratio_(1_n)="10" Release_time_(ms)="800" Threshold_level_(dB)="-15"

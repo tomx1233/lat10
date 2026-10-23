@@ -1,0 +1,13 @@
+ClipFix:gain="-10.5" threshold="85"
+
+ChangeTempo:Percentage="2.5" SBSMS="0"
+
+ChangePitch:Percentage="1.4" SBSMS="0"
+
+BassAndTreble:Bass="-17" Gain="0" Link_Sliders="0" Treble="0"
+
+BcTripleEq4(stereo):Bandwidth="0.01369863" Bypass="0" Frequency="0.88573867" Gain="0.46250001" High="0.89565217" Low="0.59565216" Mid="0.073913045"
+
+TdrNova:Analyzer_Mode="0" Analyzer_Speed="0.5" Band_1_Active="0" Band_1_Attack="0.32960382" Band_1_Dyn="0.5" Band_1_Frequency="0.37420303" Band_1_Gain="0" Band_1_Q="0.44605291" Band_1_Ratio="0.5" Band_1_Release="0.36457238" Band_1_selected="0" Band_1_Split="0" Band_1_Threshold="0" Band_1_Type="0" Band_2_Active="0" Band_2_Attack="0.32960382" Band_2_Dyn="0" Band_2_Frequency="0.32650518" Band_2_Gain="0.5" Band_2_Q="0.56238186" Band_2_Ratio="0.5" Band_2_Release="0.36457238" Band_2_selected="0" Band_2_Split="0" Band_2_Threshold="1" Band_2_Type="0.5" Band_3_Active="1" Band_3_Attack="0.2482948" Band_3_Dyn="0.5" Band_3_Frequency="0.50305378" Band_3_Gain="0.31000361" Band_3_Q="0.94682223" Band_3_Ratio="0.92307693" Band_3_Release="0.12152413" Band_3_selected="0" Band_3_Split="1" Band_3_Threshold="0.31286213" Band_3_Type="0.5" Band_4_Active="0" Band_4_Attack="0.32960382" Band_4_Dyn="0" Band_4_Frequency="0.74928516" Band_4_Gain="0.5" Band_4_Q="0.43761814" Band_4_Ratio="0.5" Band_4_Release="0.36457238" Band_4_selected="0" Band_4_Split="0" Band_4_Threshold="1" Band_4_Type="1" Channels="0.16666667" Display_EQ_Range="1" Display_FFT_Floor="0" Dry_Mix="0.25139508" Dynamic_delta="0" EQ_Auto_Gain="1" HP_Active="1" HP_Frequency="0.071008146" HP_Selected="0" HP_Type="0" LP_Active="1" LP_Frequency="1" LP_Selected="1" LP_Type="1" Master_bypass="0" Output_Gain="0.63857782" Quality="1" Sidechain_Mode="0" Solo="0" Wide_Band_Attack="0.33768171" Wide_Band_Dyn="1" Wide_Band_Gain="0.86603832" Wide_Band_Ratio="0.44444445" Wide_Band_Release="0.12152413" Wide_Band_Threshold="0.9493553"
+
+BassAndTreble:Bass="0" Gain="0" Link_Sliders="0" Treble="-17"
