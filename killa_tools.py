@@ -26,6 +26,7 @@ libvorbis two-pass) and the two Roblox polling endpoints are derived from it.
 
 import glob
 import gzip
+import html
 import json
 import math
 import os
@@ -84,8 +85,102 @@ def _run(args, timeout=180):
         raise RuntimeError("ffmpeg timed out processing that file (it may be too long).")
 
 
-_FFMPEG = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
-_FFPROBE = ["ffprobe", "-v", "error"]
+def _resolve_ffmpeg_bin():
+    found = shutil.which("ffmpeg")
+    if found:
+        return found
+    try:
+        import imageio_ffmpeg  # noqa: PLC0415
+        exe = imageio_ffmpeg.get_ffmpeg_exe()
+        if exe and os.path.isfile(exe):
+            return exe
+    except Exception:
+        pass
+    return "ffmpeg"
+
+
+def _resolve_ffprobe_bin():
+    found = shutil.which("ffprobe")
+    if found:
+        return found
+    return "ffprobe"
+
+
+_FFMPEG_BIN = _resolve_ffmpeg_bin()
+_FFPROBE_BIN = _resolve_ffprobe_bin()
+_FFMPEG = [_FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error"]
+_FFPROBE = [_FFPROBE_BIN, "-v", "error"]
+
+# Metadata-stripping flags so exported audio files never retain encoder names,
+# software tags, comments, prompts, or AI-related text markers.
+_CLEAN_META_FLAGS = [
+    "-map_metadata", "-1",
+    "-dn", "-vn", "-sn",
+    "-fflags", "+bitexact",
+    "-flags:a", "+bitexact",
+    "-metadata", "encoder=",
+    "-metadata", "comment=",
+    "-metadata", "description=",
+    "-metadata", "software=",
+    "-metadata", "encoded_by=",
+    "-metadata", "lyrics=",
+    "-metadata:s:a:0", "encoder=",
+]
+_CLEAN_MP3_FLAGS = _CLEAN_META_FLAGS + ["-write_xing", "0", "-id3v2_version", "0"]
+
+_AI_BRACKET_PATTERNS = re.compile(
+    r"[\(\[\{]\s*"
+    r"(?:ai[\s_-]*generated|generated[\s_-]*by[\s_-]*ai|made[\s_-]*with[\s_-]*ai|"
+    r"ai[\s_-]*(?:audio|song|music|cover|voice)|suno(?:[\s_-]*ai)?|udio(?:[\s_-]*ai)?|ai)"
+    r"\s*[\)\]\}]",
+    re.IGNORECASE,
+)
+
+_AI_STEM_PATTERNS = re.compile(
+    r"(?:^|(?<=[\s_.\-\(\[\{]))"
+    r"(?:ai[\s_-]*generated|generated[\s_-]*by[\s_-]*ai|made[\s_-]*with[\s_-]*ai|"
+    r"ai[\s_-]*audio|ai[\s_-]*song|ai[\s_-]*music|ai[\s_-]*cover|ai[\s_-]*voice|"
+    r"suno[\s_-]*ai|udio[\s_-]*ai|suno|udio|ai)"
+    r"(?=$|[\s_.\-\)\]\}])",
+    re.IGNORECASE,
+)
+
+
+def clean_export_stem(raw_name, fallback="audio"):
+    """Sanitize an exported audio basename and remove any AI-related wording."""
+    stem = os.path.splitext(os.path.basename(str(raw_name or "")))[0]
+    stem = _AI_BRACKET_PATTERNS.sub("", stem)
+    for _ in range(3):
+        updated = _AI_STEM_PATTERNS.sub("", stem)
+        if updated == stem:
+            break
+        stem = updated
+    stem = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", stem)
+    stem = re.sub(r"\(\s*\)|\[\s*\]|\{\s*\}", "", stem)
+    stem = re.sub(r"_{2,}", "_", stem)
+    stem = re.sub(r" {2,}", " ", stem)
+    stem = re.sub(r"(?:_-\s*|\s*-_)", "-", stem)
+    stem = re.sub(r"-{2,}", "-", stem).strip(" _.-")
+    return (stem[:60].strip(" _.-") if stem else "") or fallback
+
+
+def strip_audio_metadata(path):
+    """Strip all container, ID3, Xing/LAME, Vorbis, or RIFF tags from `path` in-place."""
+    if not path or not os.path.isfile(path):
+        return False
+    ext = os.path.splitext(path)[1].lower()
+    tmp = f"{path}.clean{ext}"
+    flags = _CLEAN_MP3_FLAGS if ext == ".mp3" else _CLEAN_META_FLAGS
+    rc, _out, _err = _run(_FFMPEG + ["-i", path] + flags + ["-c:a", "copy", tmp])
+    if rc == 0 and os.path.isfile(tmp) and os.path.getsize(tmp) > 256:
+        os.replace(tmp, path)
+        return True
+    try:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+    except OSError:
+        pass
+    return False
 
 
 def _ffmpeg_probe_json(path):
@@ -99,8 +194,9 @@ def _ffmpeg_probe_json(path):
     carries the tail of ffmpeg's output so the cause is visible in logs).
     """
     last = ""
+    ffmpeg_bin = globals().get("_FFMPEG_BIN", "ffmpeg")
     for attempt in range(3):
-        rc, _out, err = _run(["ffmpeg", "-hide_banner", "-nostats", "-i", path,
+        rc, _out, err = _run([ffmpeg_bin, "-hide_banner", "-nostats", "-i", path,
                               "-f", "null", "-"])
         text = err or ""
         # ffmpeg's report re-lists the stream in a trailing Output section with
@@ -146,8 +242,11 @@ def ffprobe_json(path):
     # (an antivirus scan / lock window); back off and retry a couple of times.
     rc = out = err = None
     for attempt in range(3):
-        rc, out, err = _run(_FFPROBE + ["-print_format", "json", "-show_format",
-                                        "-show_streams", path])
+        try:
+            rc, out, err = _run(_FFPROBE + ["-print_format", "json", "-show_format",
+                                            "-show_streams", path])
+        except RuntimeError:
+            break
         if rc == 0 and out.strip():
             return json.loads(out)
         if attempt < 2:
@@ -160,7 +259,7 @@ def ffprobe_json(path):
 def _loudness(path):
     """Integrated loudness (LUFS) + true peak (dBFS) via ffmpeg ebur128."""
     # ebur128 prints its summary at info level, so we can't pass -loglevel error.
-    rc, _out, err = _run(["ffmpeg", "-hide_banner", "-nostats", "-i", path,
+    rc, _out, err = _run([_FFMPEG_BIN, "-hide_banner", "-nostats", "-i", path,
                           "-af", "ebur128=peak=true", "-f", "null", "-"])
     if not err:
         raise RuntimeError("ffmpeg gave no loudness output.")
@@ -207,7 +306,83 @@ AUTOFIT_PEAK_SLACK_DB = 1.0       # allowed above the source's own true peak
 AUTOFIT_PEAK_CAP_DB = 3.0         # cap used when the source can't be measured
 
 
-def _match_loudness(work_wav, output_path, source_path, progress=None):
+_V4_COMB_NOTCHES = (
+    (2550, 120),
+    (3700, 150),
+    (5050, 185),
+    (6650, 225),
+    (8500, 265),
+    (10600, 310),
+    (12950, 355),
+    (15550, 390),
+)
+
+
+def _v4_comb_gain_entry():
+    """Piecewise gain_entry for V4's zero-phase FIR sub-critical-band comb."""
+    entries = ["entry(0,0)", "entry(2050,0.4)"]
+    for center, half_w in _V4_COMB_NOTCHES:
+        entries.append(f"entry({center - half_w - 85},1.7)")
+        entries.append(f"entry({center - half_w},-65)")
+        entries.append(f"entry({center + half_w},-65)")
+        entries.append(f"entry({center + half_w + 85},1.7)")
+    entries.append("entry(17400,1.2)")
+    entries.append("entry(18250,-65)")
+    entries.append("entry(24000,-65)")
+    return ";".join(entries)
+
+
+def _v4_studio_af(include_comb=True):
+    """Stereo studio processing chain for Auto-Fit V4 (no tremolo warble, no mono fold)."""
+    chain = (
+        "aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,"
+        "allpass=f=680:t=q:w=1.1,allpass=f=2400:t=q:w=1.1,"
+        "aphaser=in_gain=0.95:out_gain=0.97:delay=1.4:decay=0.18:speed=0.25:type=triangular,"
+        "extrastereo=m=1.14,crystalizer=i=0.45,apulsator=mode=sine:hz=0.20:amount=0.04,"
+        "acompressor=threshold=-16dB:ratio=1.8:attack=25:release=220:makeup=1.0dB"
+    )
+    if include_comb:
+        chain += f",firequalizer=gain_entry='{_v4_comb_gain_entry()}':zero_phase=1:accuracy=4"
+    return chain
+
+
+def _render_v4_studio_base(input_path, out_wav):
+    """Render V4's stereo studio FX base WAV via ffmpeg when Audacity isn't running."""
+    rc, _out, err = _run(
+        _FFMPEG + ["-i", input_path, "-af", _v4_studio_af(include_comb=True)]
+        + _CLEAN_META_FLAGS + [out_wav]
+    )
+    if rc != 0:
+        raise RuntimeError("V4 studio base render failed."
+                           + (f" ({err.strip()})" if err.strip() else ""))
+    return out_wav
+
+
+def _v4_sculpt_filter_complex(gain_db, clip_threshold, duration_secs):
+    """Build V4's loudness + zero-phase spectral lattice + ultrasonic double-helix graph."""
+    dur = max(float(duration_secs or 30.0), 8.0)
+    fm = max(0.025, min(0.45, 9.0 / dur))
+    beta = round(750.0 / fm, 2)
+    rib_ch0 = (
+        f"(0.32*min(0.22,abs(val(0))))*("
+        f"sin(2*PI*19700*t+{beta}*sin(2*PI*{fm:.5f}*t))"
+        f"+0.95*sin(2*PI*19700*t-{beta}*sin(2*PI*{fm:.5f}*t)))"
+    )
+    rib_ch1 = rib_ch0.replace("val(0)", "val(1)")
+    gain_entry = _v4_comb_gain_entry()
+    return (
+        f"[0:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,asplit=2[s_main][s_rib];"
+        f"[s_main]volume={gain_db:.2f}dB,"
+        f"asoftclip=type=atan:oversample=4:threshold={clip_threshold},"
+        f"firequalizer=gain_entry='{gain_entry}':zero_phase=1:accuracy=4[main];"
+        f"[s_rib]lowpass=f=20,aeval='{rib_ch0}|{rib_ch1}',"
+        f"highpass=f=18850,highpass=f=18850,highpass=f=18850[rib];"
+        f"[main][rib]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,"
+        f"alimiter=limit=0.89:level=0:attack=3:release=40"
+    )
+
+
+def _match_loudness(work_wav, output_path, source_path, progress=None, *, v4_sculpt=False):
     """Re-encode `work_wav` to MP3 at `output_path`, matching the source's loudness.
 
     Returns {"source_lufs", "out_lufs", "out_peak", "gain_db"}; the loudness
@@ -221,12 +396,28 @@ def _match_loudness(work_wav, output_path, source_path, progress=None):
         target = source_peak = None
     peak_cap = (source_peak + AUTOFIT_PEAK_SLACK_DB if source_peak is not None
                 else AUTOFIT_PEAK_CAP_DB)
+    try:
+        work_dur = _duration_seconds(work_wav)
+    except Exception:
+        work_dur = 30.0
 
     def _encode(dst, gain_db):
-        af = (f"volume={gain_db:.2f}dB,asoftclip=type=atan:oversample=4"
-              f":threshold={AUTOFIT_CLIP_THRESHOLD}")
-        rc, _out, err = _run(_FFMPEG + ["-i", work_wav, "-af", af,
-                                        "-c:a", "libmp3lame", "-b:a", "192k", dst])
+        if v4_sculpt:
+            fc = _v4_sculpt_filter_complex(gain_db, AUTOFIT_CLIP_THRESHOLD, work_dur)
+            cmd = (
+                _FFMPEG + ["-i", work_wav, "-filter_complex", fc]
+                + _CLEAN_MP3_FLAGS
+                + ["-c:a", "libmp3lame", "-b:a", "256k", "-cutoff", "21000", dst]
+            )
+        else:
+            af = (f"volume={gain_db:.2f}dB,asoftclip=type=atan:oversample=4"
+                  f":threshold={AUTOFIT_CLIP_THRESHOLD}")
+            cmd = (
+                _FFMPEG + ["-i", work_wav, "-af", af]
+                + _CLEAN_MP3_FLAGS
+                + ["-c:a", "libmp3lame", "-b:a", "192k", dst]
+            )
+        rc, _out, err = _run(cmd)
         if rc != 0:
             raise RuntimeError("auto-fit mp3 re-encode failed."
                                + (f" ({err.strip()})" if err.strip() else ""))
@@ -429,8 +620,11 @@ def copyr8_process(input_path, output_path, spectrogram_path, preset_name="balan
         f"atempo={tempo:.6f}"
     )
 
-    rc, _out, err = _run(_FFMPEG + ["-i", input_path, "-af", af,
-                                    "-c:a", "libmp3lame", "-b:a", "192k", output_path])
+    rc, _out, err = _run(
+        _FFMPEG + ["-i", input_path, "-af", af]
+        + _CLEAN_MP3_FLAGS
+        + ["-c:a", "libmp3lame", "-b:a", "192k", output_path]
+    )
     if rc != 0:
         raise RuntimeError("copyr8 pass failed." + (f" ({err.strip()})" if err.strip() else ""))
 
@@ -543,8 +737,8 @@ def _mark_rate_limited(progress=None):
     _breath_seconds = _SHA_BREATH_SECONDS
     _ok_streak = 0
     if progress:
-        progress(f"Shazam rate limit from the API -- pausing {wait:.0f}s for the "
-                 "cool-down before testing again")
+        progress(f"API pacing (API Cooldown) -- Shazam rate limit hit; pausing {wait:.0f}s "
+                 "before testing again")
 
 
 def _mark_ok():
@@ -586,19 +780,22 @@ def pacing_status(now=None):
 
 
 def _throttle(progress=None):
-    """Sleep past the rate-limit cool-down, then keep the base POST spacing."""
+    """Sleep past the rate-limit cool-down, then keep the API Cooldown spacing."""
     global _last_post_time
     now = time.time()
     if _rate_limit_until > now:
         wait = _rate_limit_until - now
         if progress:
-            progress(f"still waiting on Shazam's rate limit -- {wait:.0f}s of the "
-                     "cool-down left")
+            progress(f"API pacing (API Cooldown) -- waiting {wait:.0f}s for rate-limit "
+                     "cool-down to finish")
         time.sleep(wait)
         now = time.time()
     elapsed = now - _last_post_time
     if elapsed < _breath_seconds:
-        time.sleep(_breath_seconds - elapsed)
+        wait = _breath_seconds - elapsed
+        if progress and wait >= 0.5:
+            progress(f"API pacing (API Cooldown) -- cooling down {wait:.1f}s between audio probes")
+        time.sleep(wait)
     _last_post_time = time.time()
 
 
@@ -664,6 +861,7 @@ def _shazam_match_count(path, progress=None):
         return await asyncio.wait_for(
             shazam.recognize(path), timeout=SHA_PROBE_TIMEOUT_SECONDS)
 
+    global _last_post_time
     for _attempt in range(SHA_PROBE_RETRIES):
         _throttle(progress)
         try:
@@ -675,6 +873,10 @@ def _shazam_match_count(path, progress=None):
         except Exception:  # noqa: BLE001 -- network-level failure, retry below
             _mark_rate_limited(progress)
             continue
+        finally:
+            # Stamp completion time so the full API Cooldown spacing elapses
+            # in between consecutive audio clips rather than overlapping the HTTP call.
+            _last_post_time = time.time()
         if not isinstance(data, dict):
             _mark_rate_limited(progress)
             continue
@@ -702,7 +904,11 @@ def _probe_sweep(path, windows, progress=None, *, include_acoustid=True, include
     rejected and the rest of the windows would only burn API calls.
     """
     counts = []
-    for start in windows:
+    total_w = len(windows)
+    for idx, start in enumerate(windows):
+        if idx > 0 and progress:
+            progress(f"testing in-between audio window {idx + 1}/{total_w} "
+                     f"({start:.1f}s..{start + SHA_PROBE_CLIP_SECONDS:.1f}s)...")
         clip = f"{path}.probe.wav"
         rc, _out, err = _run(_FFMPEG + ["-i", path, "-ss", f"{start:.3f}",
                                         "-t", f"{SHA_PROBE_CLIP_SECONDS:.3f}",
@@ -773,11 +979,15 @@ def _probe_sweep_shifted(input_path, windows, pitch_st, tempo_factor,
         duration = _duration_seconds(input_path)
     except (RuntimeError, ValueError):
         duration = 0.0  # unknown length: cut as asked, ffmpeg stops at EOF
-    for start in windows:
+    total_w = len(windows)
+    for idx, start in enumerate(windows):
         if duration > src_clip:
             # Keep the (longer) source cut inside the file so the tail window
             # is not truncated back under the probe length.
             start = min(start, round(duration - src_clip, 3))
+        if idx > 0 and progress:
+            progress(f"testing in-between audio window {idx + 1}/{total_w} "
+                     f"({start:.1f}s..{start + src_clip:.1f}s)...")
         # -ss/-t MUST be input options (before -i). With them after -i, ffmpeg
         # runs the atempo chain over the stream first and then seeks in the
         # FILTERED timeline, so a probe at `start` sampled source
@@ -989,9 +1199,9 @@ def find_undetectable(input_path, output_path, progress=None):
                 progress("testing uniform shift %+.1f st / +%.0f%%..." % (
                     pitch, pct))
 
-            # Render the candidate in full and confirm every window on the
-            # FINISHED file, so the acceptance test matches what the user hears.
-            windows = _window_points(_duration_seconds(input_path))
+            # Confirm every gap-free window across the start, in-between body,
+            # and tail of the song before accepting a shift.
+            windows = _gapfree_windows(input_path)
             ok, counts = _probe_sweep_shifted(input_path, windows, pitch, tempo,
                                               0.0, 0.0, progress=progress)
             if counts is not None and None not in counts:
@@ -1049,7 +1259,7 @@ def find_undetectable(input_path, output_path, progress=None):
     if progress:
         progress("strongest shift still not fully clean; using it anyway")
     _render_shifted_wav(input_path, output_path, pitch, tempo)
-    windows = _window_points(_duration_seconds(output_path))
+    windows = _gapfree_windows(output_path)
     return {"pitch": pitch, "tempo": tempo, "counts": None,
             "windows": windows, "verified": None,
             "info": {"pitch": pitch, "tempo": tempo, "level_gain_db": 0.0}}
@@ -1552,16 +1762,13 @@ def copyr8_autofit_v3(input_path, output_path, spectrogram_path, progress=None,
 
 def copyr8_autofit_v4(input_path, output_path, spectrogram_path, progress=None,
                       macro_fn=None):
-    """Auto-Fit V4: V3's search driven by the V4 (mono wobble) macro chain.
+    """Auto-Fit V4: stereo studio FX + zero-phase spectral sculpting + clean search.
 
-    Identical machinery to copyr8_autofit_v3 -- macro base, probe-then-ship,
-    the unverified protection shift, the mixed rung walk with the verified
-    tremolo overlay, and the loudness-matched export -- but Stage 1 runs the
-    V4 chain (Stereo to Mono -> duplicate panned L/R -> Tremolo x2 on the
-    right -> Mix and Render -> SC1 x2), bundled as
-    macros/CopyR8 AutoFit V4.txt and overridable with COPYR8_V4_MACRO.
-    The macro already carries its own tremolo; the engine's verified overlay
-    pass still runs on top of the winning shift, as in V3.
+    Preserves full stereo imaging and natural tonal balance (no mono collapse,
+    no tremolo warble, and no dual-SC1 compression pumping) while applying
+    phase dispersion, subtle phaser/stereo width, sub-critical-band zero-phase
+    FIR comb sculpting, and an envelope-gated ultrasonic double-helix braid so
+    the spectrogram looks distinctly transformed while the audio sounds clean.
     """
     return _copyr8_autofit_macro_search(
         input_path, output_path, spectrogram_path, progress=progress,
@@ -1571,17 +1778,18 @@ def copyr8_autofit_v4(input_path, output_path, spectrogram_path, progress=None,
 def _copyr8_autofit_macro_search(input_path, output_path, spectrogram_path,
                                  progress=None, macro_fn=None, tag="v3",
                                  env_hint="COPYR8_V3_MACRO"):
-    """Shared Auto-Fit V3/V4 engine (see copyr8_autofit_v3's docstring).
+    """Shared Auto-Fit V3/V4 engine (see copyr8_autofit_v3 and copyr8_autofit_v4).
 
-    `tag` only names the temp work files (autofit_<tag>_base.wav / _work.wav)
-    so the two fits never collide; `env_hint` names the macro env var in the
-    "no macro configured" message.
+    `tag` names the temp work files (autofit_<tag>_base.wav / _work.wav) and
+    selects V4's tremolo-free studio + spectrogram-sculpting pipeline when
+    `tag == "v4"`.
     """
     if not os.path.isfile(input_path):
         raise RuntimeError("the input file could not be read from disk.")
     acoustid_backend.validate_setup(required=False)
     songrec_backend.validate_setup(required=False)
 
+    is_v4 = (tag == "v4")
     workdir = os.path.dirname(output_path) or "."
     work_wav = os.path.join(workdir, f"autofit_{tag}_work.wav")
     base_wav = os.path.join(workdir, f"autofit_{tag}_base.wav")
@@ -1601,28 +1809,35 @@ def _copyr8_autofit_macro_search(input_path, output_path, spectrogram_path,
                     base_path = base_wav
                 else:
                     macro_info["reason"] = ("the macro ran but wrote no output; "
+                                            "searching shifts on the studio base"
+                                            if is_v4 else
+                                            "the macro ran but wrote no output; "
                                             "searching shifts on the original")
                     if progress:
                         progress(macro_info["reason"])
             except Exception as e:  # noqa: BLE001
                 macro_info["reason"] = (f"the macro failed ({e}); "
-                                        "searching shifts on the original")
+                                        + ("using built-in V4 studio processing"
+                                           if is_v4 else
+                                           "searching shifts on the original"))
                 if progress:
                     progress(macro_info["reason"])
         else:
             macro_info["reason"] = (f"no macro configured (set {env_hint}); "
-                                    "searching shifts on the original")
+                                    + ("using built-in V4 studio processing"
+                                       if is_v4 else
+                                       "searching shifts on the original"))
             if progress:
                 progress(macro_info["reason"])
 
-        # Stage 2: the base may already be unreadable -- nothing could be
-        # closer to the original than that, so it is checked before any shift.
-        # Only a MACRO-PROCESSED base may ship at 0.0 st / 1.00x. Without a
-        # macro the base IS the untouched original, and a clean sweep of it
-        # only means the databases don't know the track -- shipping it would
-        # hand back the original file with no protection at all. That case goes
-        # straight to the Stage 3 walk, whose control check applies the
-        # balanced protection shift when the track is unverified.
+        if is_v4 and not macro_info["applied"]:
+            try:
+                _render_v4_studio_base(input_path, base_wav)
+                base_path = base_wav
+            except Exception:
+                base_path = input_path
+
+        # Stage 2: only a MACRO-PROCESSED base may ship at 0.0 st / 1.00x.
         ok, counts = False, None
         if macro_info["applied"]:
             windows = _gapfree_windows(base_path)
@@ -1635,8 +1850,6 @@ def _copyr8_autofit_macro_search(input_path, output_path, spectrogram_path,
             p_pitch, p_tempo, p_cost = 0.0, 1.0, 0.0
             final_wav = base_path
             if verified is False:
-                # Neither service knows the original, so the base sweeping
-                # clean proves nothing: protect it with the balanced shift.
                 p_pitch, p_tempo = UNVERIFIED_PROTECTION
                 p_cost = _protection_cost()
                 if progress:
@@ -1658,16 +1871,19 @@ def _copyr8_autofit_macro_search(input_path, output_path, spectrogram_path,
                       "info": {"pitch": p_pitch, "tempo": p_tempo,
                                "level_gain_db": 0.0}}
         else:
-            rungs = _v3_adjust_rungs()
+            rungs = ([r for r in _v3_adjust_rungs() if not r[3]]
+                     if is_v4 else _v3_adjust_rungs())
             if progress:
                 progress("the filter still detects the base; adding preset "
                          f"adjustments ({len(rungs)} settings), mildest first, "
                          "testing each one against the API...")
-            result = find_mildest(base_path, work_wav, progress=progress,
-                                  use_tremolo=True,
-                                  overlay_tremolo=AUTOFIT_V2_TREMOLO,
-                                  rungs=rungs,
-                                  control_path=input_path)
+            result = find_mildest(
+                base_path, work_wav, progress=progress,
+                use_tremolo=(not is_v4),
+                overlay_tremolo=(None if is_v4 else AUTOFIT_V2_TREMOLO),
+                rungs=rungs,
+                control_path=input_path,
+            )
             final_wav = work_wav
 
         pitch = result["pitch"]
@@ -1681,7 +1897,9 @@ def _copyr8_autofit_macro_search(input_path, output_path, spectrogram_path,
         tremolo_applied = bool(result.get("overlay_applied"))
         level_db = (result.get("info") or {}).get("level_gain_db")
 
-        loudness = _match_loudness(final_wav, output_path, input_path, progress=progress)
+        loudness = _match_loudness(
+            final_wav, output_path, input_path, progress=progress, v4_sculpt=is_v4
+        )
         rc, _out, err = _run(_FFMPEG + ["-i", output_path, "-lavfi",
                                         "showspectrumpic=s=1100x280:legend=0:gain=.5:color=plasma",
                                         spectrogram_path])
@@ -1787,8 +2005,8 @@ def roblox_simulate(input_path, pass1_path, pass2_path, waveform_path, quality=0
                                     "-c:a", "libvorbis", "-q:a", str(quality), pass1_path])
     if rc != 0:
         raise RuntimeError("first compression pass failed." + (f" ({err.strip()})" if err.strip() else ""))
-    rc, _out, err = _run(_FFMPEG + ["-i", pass1_path, "-c:a", "libvorbis",
-                                    "-q:a", str(quality), pass2_path])
+    rc, _out, err = _run(_FFMPEG + ["-i", pass1_path] + _CLEAN_META_FLAGS
+                                 + ["-c:a", "libvorbis", "-q:a", str(quality), pass2_path])
     if rc != 0:
         raise RuntimeError("second compression pass failed." + (f" ({err.strip()})" if err.strip() else ""))
     info = analyze_audio(pass2_path)
@@ -1860,8 +2078,8 @@ def _get(url, cookie=ROBLOX_COOKIE, timeout=15, return_headers=False):
         if return_headers:
             return e.code, body, dict(e.headers)
         return e.code, body
-    except Exception as e:
-        return None, "", {}
+    except Exception:
+        return (None, "", {}) if return_headers else (None, "")
 
 
 def _get_bytes(url, cookie=ROBLOX_COOKIE, timeout=30):
@@ -1875,12 +2093,12 @@ def _get_bytes(url, cookie=ROBLOX_COOKIE, timeout=30):
             return resp.status, resp.read()
     except urllib.error.HTTPError as e:
         return e.code, b""
-    except Exception as e:
+    except Exception:
         return None, b""
 
 
 # --------------------------------------------------------------------------- #
-# /monitor  (asset moderation)
+# /monitor & /analyze roblox  (asset moderation + lookup + delivery)
 # --------------------------------------------------------------------------- #
 def require_cookie():
     """Raise a clear message when there's no cookie (ending with the scoped reply)."""
@@ -1916,57 +2134,145 @@ def get_asset_moderation(asset_id):
     }
 
 
+def lookup_roblox_asset(asset_id):
+    """Best-effort metadata lookup for a Roblox asset ID (works with or without cookie)."""
+    import verify_audio  # noqa: PLC0415
+
+    aid = int(asset_id)
+    eco = verify_audio._economy(aid) or {}
+    mkt = verify_audio._marketplace(aid) or {}
+    asset_type_id = eco.get("AssetTypeId") or mkt.get("AssetTypeId")
+    creator_obj = eco.get("Creator") or mkt.get("Creator") or {}
+    name = eco.get("Name") or mkt.get("Name")
+    description = eco.get("Description") or mkt.get("Description") or ""
+    creator = creator_obj.get("Name") or None
+    is_banned = bool(mkt.get("IsBanned"))
+    mod_state = None
+    if ROBLOX_COOKIE:
+        try:
+            mod = get_asset_moderation(aid)
+            mod_state = mod.get("state")
+            if not name and mod.get("display_name"):
+                name = mod["display_name"]
+            if not description and mod.get("description"):
+                description = mod["description"]
+        except Exception:
+            mod_state = None
+
+    return {
+        "id": aid,
+        "name": name or f"Asset {aid}",
+        "creator": creator,
+        "asset_type_id": asset_type_id,
+        "asset_type": verify_audio._type_name(asset_type_id) if asset_type_id else None,
+        "is_audio": asset_type_id in (None, 3, 12),
+        "is_banned": is_banned,
+        "moderation_state": mod_state,
+        "description": description,
+    }
+
+
+def _unpack_delivery_bytes(data, cookie=ROBLOX_COOKIE):
+    """Gunzip or follow JSON CDN location payload from Roblox assetdelivery."""
+    if not data:
+        return b""
+    if data[:2] == b"\x1f\x8b":
+        try:
+            data = gzip.decompress(data)
+        except OSError:
+            pass
+    stripped = data.lstrip()
+    if stripped.startswith(b"{"):
+        try:
+            payload = json.loads(stripped.decode("utf-8", "replace"))
+            if isinstance(payload, dict):
+                if payload.get("errors"):
+                    return b""
+                locs = payload.get("locations") or []
+                loc_url = (
+                    (locs[0].get("location") if locs and isinstance(locs[0], dict) else None)
+                    or payload.get("location")
+                )
+                if loc_url:
+                    st2, d2 = _get_bytes(loc_url, cookie="")
+                    if st2 == 200 and d2:
+                        if d2[:2] == b"\x1f\x8b":
+                            try:
+                                d2 = gzip.decompress(d2)
+                            except OSError:
+                                pass
+                        return d2
+                    return b""
+        except Exception:
+            pass
+    return data
+
+
 def download_asset_audio(asset_id):
     """Download an audio asset's bytes via the delivery endpoint (follows redirects).
 
-    assetdelivery serves the body GZIP-COMPRESSED (every asset type comes back
-    wrapped in a `1f 8b` header, audio OggS bytes included), so it's gunzipped
-    here before returning — otherwise ffmpeg/ffprobe see a gzip container, not
-    audio, and the re-encode/analysis fails.
+    Uses ROBLOX_COOKIE automatically when configured, and still attempts public
+    delivery when unset so public Roblox audio assets can be downloaded too.
     """
-    require_cookie()
-    status, data = _get_bytes(ASSET_DELIVERY_URL.format(id=asset_id))
-    if status == 200 and data:
-        if data[:2] == b"\x1f\x8b":
-            try:
-                data = gzip.decompress(data)
-            except OSError:
-                pass  # not a real gzip stream; hand back the bytes as-is
-        return data
+    status, raw = _get_bytes(ASSET_DELIVERY_URL.format(id=asset_id))
+    if status == 200 and raw:
+        data = _unpack_delivery_bytes(raw)
+        if data and len(data) >= 128:
+            return data
+        raise RuntimeError(f"Roblox returned an empty or unreadable payload for asset {asset_id}.")
     if status in (401, 403, 409):
-        # 401 = no valid session; 403/409 = account genuinely not allowed (a
-        # private / group-locked / archived or non-audio asset). No downloader
-        # can fetch those, so say so instead of a generic failure.
         if status == 401:
+            if not ROBLOX_COOKIE:
+                raise RuntimeError(
+                    f"asset {asset_id} requires Roblox authentication (set ROBLOX_COOKIE in .env).")
             raise RuntimeError(
                 f"asset {asset_id} needs Roblox authentication, but the session "
                 "isn't valid (401). refresh ROBLOX_COOKIE in .env.")
         raise RuntimeError(
-            f"this asset ({asset_id}) isn't publicly downloadable — it returned "
-            f"{status} 'not authorized' (private / group-locked or archived). No "
-            "downloader can fetch it.")
+            f"this asset ({asset_id}) isn't downloadable (HTTP {status}: "
+            "private, group-locked, moderated, or archived).")
+    if status == 404:
+        raise RuntimeError(f"asset {asset_id} was not found on Roblox (404).")
     if status is None:
         raise RuntimeError("could not reach the Roblox delivery endpoint (network).")
     raise RuntimeError(f"could not download audio (status {status})")
 
 
 # --------------------------------------------------------------------------- #
-# /download  (yt-dlp)
+# /download  (yt-dlp + Spotify metadata search + SoundCloud support)
 # --------------------------------------------------------------------------- #
-# yt-dlp is a separate CLI (installed via `winget install yt-dlp.yt-dlp`) and is
-# NOT a Python module in the bot's interpreter, so it's driven as a subprocess.
-# This fallback is the WinGet shim path in case the process PATH does not include
-# the WinGet Links directory.
 _YTDLP_FALLBACK = r"C:\Users\james\AppData\Local\Microsoft\WinGet\Links\yt-dlp"
-# Discord's message-attachment ceiling (~25MB). Anything bigger is re-encoded.
 _DISCORD_MAX_BYTES = 24 * 1024 * 1024
+
+_SPOTIFY_URI_RE = re.compile(
+    r"^spotify:(track|album|playlist|episode):([A-Za-z0-9]+)$", re.IGNORECASE
+)
+_SPOTIFY_URL_RE = re.compile(
+    r"open\.spotify\.com/(?:intl-[a-z0-9-]+/)?(?:embed/)?"
+    r"(track|album|playlist|episode)/([A-Za-z0-9]+)",
+    re.IGNORECASE,
+)
+_SPOTIFY_SHORT_HOSTS = {"spotify.link", "spoti.fi", "www.spotify.link"}
+_SOUNDCLOUD_SHORT_HOSTS = {"on.soundcloud.com", "soundcloud.app.goo.gl"}
+_SOUNDCLOUD_HOSTS = {
+    "soundcloud.com", "www.soundcloud.com", "m.soundcloud.com",
+    "on.soundcloud.com", "soundcloud.app.goo.gl",
+}
+_SC_DROP_QUERY_KEYS = {
+    "si", "utm_source", "utm_medium", "utm_campaign", "utm_term",
+    "utm_content", "ref", "clipboard", "feature",
+}
 
 
 def _ytdlp_bin():
-    """Locate the yt-dlp CLI (prefer PATH, else the known WinGet shim)."""
+    """Locate the yt-dlp CLI (prefer PATH, else active venv, else WinGet shim)."""
     p = shutil.which("yt-dlp")
     if p:
         return p
+    py_dir = os.path.dirname(os.path.abspath(__import__("sys").executable))
+    for cand in (os.path.join(py_dir, "yt-dlp.exe"), os.path.join(py_dir, "yt-dlp")):
+        if os.path.isfile(cand):
+            return cand
     if os.path.isfile(_YTDLP_FALLBACK):
         return _YTDLP_FALLBACK
     raise RuntimeError(
@@ -1978,9 +2284,10 @@ def _run_yt(args, timeout, what="yt-dlp"):
     try:
         p = subprocess.run(
             list(args), capture_output=True, text=True, timeout=timeout,
+            errors="replace",
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0,
         )
-        return p.returncode, p.stdout, p.stderr
+        return p.returncode, p.stdout or "", p.stderr or ""
     except FileNotFoundError:
         raise RuntimeError(f"{what} is not installed or not on PATH.")
     except subprocess.TimeoutExpired:
@@ -1988,16 +2295,7 @@ def _run_yt(args, timeout, what="yt-dlp"):
 
 
 def _cookies_args():
-    """Build yt-dlp cookie args from opt-in env config (used for gated/region pages).
-
-    Real content DRM (Widevine/PlayReady) is NOT acceptable here -- yt-dlp refuses
-    to decrypt those and this code does nothing to help. What these cookies DO fix
-    are the sites that simply want a logged-in session (age/login walls, some
-    region-locked or bot-protected pages) and otherwise report a vague error.
-
-      YT_DLP_COOKIES_BROWSER=chrome|firefox|edge   -> --cookies-from-browser <x>
-      YT_DLP_COOKIES=<path to a cookies.txt>      -> --cookies <path>
-    """
+    """Build yt-dlp cookie args from opt-in env config (used for gated/region pages)."""
     args = []
     browser = (os.getenv("YT_DLP_COOKIES_BROWSER") or "").strip().lower()
     if browser:
@@ -2013,26 +2311,278 @@ def _err_hint(err):
     e = err or ""
     el = e.lower()
     if any(k in el for k in ("drm", "widevine", "playready", "fairplay")):
-        return ("That source is real DRM-protected content (Widevine/PlayReady). "
-                "yt-dlp does not decrypt DRM, so no flag can download it. If it is "
-                "only BEHIND a login or region gate instead, add your browser cookies "
-                "and retry.")
+        return ("That source is DRM-protected content (Widevine/PlayReady). "
+                "yt-dlp does not decrypt DRM.")
     if any(k in el for k in ("sign in", "login required", "auth required", "cookies",
                              "cookie", "401", "403", "not authorized")):
         return ("The site is holding the file behind a login/region session. Set "
                 "YT_DLP_COOKIES_BROWSER to chrome/firefox/edge (or point YT_DLP_COOKIES "
                 "at a cookies.txt) and retry.")
     if any(k in el for k in ("geo", "your country", "your region", "unavailable in")):
-        return ("That content is geo-restricted and is not being served in your region. "
-                "A matching proxy/VPN would be needed.")
+        return ("That content is geo-restricted and is not being served in your region.")
     return ""
 
 
+def _resolve_redirect_url(url, timeout=10):
+    """Follow HTTP redirects (e.g. spotify.link / on.soundcloud.com) to final URL."""
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+    }
+    for method in ("HEAD", "GET"):
+        req = urllib.request.Request(url, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                final_url = resp.geturl()
+                if final_url:
+                    return final_url
+        except urllib.error.HTTPError as exc:
+            if exc.url and exc.url != url:
+                return exc.url
+            loc = (exc.headers or {}).get("Location")
+            if loc:
+                return urllib.parse.urljoin(url, loc)
+        except Exception:
+            continue
+    return url
+
+
+def _normalize_download_url(raw_url):
+    """Normalize pasted URLs/URIs, resolving Spotify/SoundCloud short links."""
+    s = str(raw_url or "").strip().strip("<>").strip()
+    m_uri = _SPOTIFY_URI_RE.match(s)
+    if m_uri:
+        kind_s, sid = m_uri.group(1).lower(), m_uri.group(2)
+        return f"https://open.spotify.com/{kind_s}/{sid}"
+    if not s.lower().startswith(("http://", "https://")):
+        return s
+
+    parsed = urllib.parse.urlsplit(s)
+    host = (parsed.hostname or "").lower()
+    if host in _SPOTIFY_SHORT_HOSTS or host in _SOUNDCLOUD_SHORT_HOSTS:
+        s = _resolve_redirect_url(s)
+        parsed = urllib.parse.urlsplit(s)
+        host = (parsed.hostname or "").lower()
+
+    if host in ("m.soundcloud.com", "www.soundcloud.com", "soundcloud.com"):
+        qs = [
+            (k, v)
+            for k, v in urllib.parse.parse_qsl(parsed.query, keep_blank_values=False)
+            if k.lower() not in _SC_DROP_QUERY_KEYS
+        ]
+        s = urllib.parse.urlunsplit((
+            "https",
+            "soundcloud.com",
+            parsed.path,
+            urllib.parse.urlencode(qs),
+            "",
+        ))
+    return s
+
+
+def _http_fetch_text(url, timeout=12):
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/json;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read(1048576).decode("utf-8", "replace")
+
+
+def _parse_spotify_embed_json(page_html):
+    """Extract {title, artist, duration_secs} from Spotify's public embed __NEXT_DATA__."""
+    m = re.search(
+        r'<script[^>]+id=["\']__NEXT_DATA__["\'][^>]*>([\s\S]*?)</script>',
+        page_html or "",
+        re.IGNORECASE,
+    )
+    if not m:
+        return None
+    try:
+        blob = json.loads(m.group(1))
+    except json.JSONDecodeError:
+        return None
+
+    entity = (
+        (((blob.get("props") or {}).get("pageProps") or {}).get("state") or {})
+        .get("data") or {}
+    ).get("entity") or {}
+    if not isinstance(entity, dict):
+        return None
+
+    # Album / playlist embed: pick lead track from trackList while keeping album artist fallback
+    track_list = entity.get("trackList")
+    if isinstance(track_list, list) and track_list:
+        first = track_list[0] if isinstance(track_list[0], dict) else {}
+        t_title = (first.get("title") or "").strip()
+        t_artist = (first.get("subtitle") or entity.get("subtitle") or "").strip()
+        t_dur_ms = first.get("duration")
+        if t_title:
+            return {
+                "title": html.unescape(t_title),
+                "artist": html.unescape(t_artist.replace("\u00a0", " ")),
+                "duration_secs": round(float(t_dur_ms) / 1000.0, 1) if t_dur_ms else None,
+            }
+
+    title = (entity.get("title") or entity.get("name") or "").strip()
+    artists = entity.get("artists")
+    if isinstance(artists, list) and artists:
+        artist_names = [
+            str(a.get("name") or "").strip()
+            for a in artists
+            if isinstance(a, dict) and a.get("name")
+        ]
+        artist = ", ".join(artist_names)
+    else:
+        artist = str(entity.get("subtitle") or "").strip()
+    dur_ms = entity.get("duration") or entity.get("duration_ms")
+    if not title:
+        return None
+    return {
+        "title": html.unescape(title),
+        "artist": html.unescape(artist.replace("\u00a0", " ")),
+        "duration_secs": round(float(dur_ms) / 1000.0, 1) if dur_ms else None,
+    }
+
+
+def _parse_spotify_html_meta(page_html):
+    """Fallback OpenGraph / <title> parser for open.spotify.com pages."""
+    if not page_html:
+        return None
+
+    def _meta(attr, key):
+        pat = (
+            rf'<meta[^>]+{attr}=["\']{re.escape(key)}["\'][^>]+content=["\']([^"\']+)["\']'
+            rf'|<meta[^>]+content=["\']([^"\']+)["\'][^>]+{attr}=["\']{re.escape(key)}["\']'
+        )
+        mm = re.search(pat, page_html, re.IGNORECASE)
+        if not mm:
+            return ""
+        return html.unescape((mm.group(1) or mm.group(2) or "").strip())
+
+    title = _meta("property", "og:title")
+    desc = _meta("property", "og:description")
+    musician = _meta("name", "music:musician_description")
+    dur_raw = _meta("name", "music:duration")
+    artist = musician
+    if not artist and desc:
+        # Spotify og:description format: "Artist · Song · 2024" or "Listen to X on Spotify. Artist · Song"
+        parts = [p.strip() for p in desc.split("·") if p.strip()]
+        if len(parts) >= 2:
+            cand = parts[0]
+            if " on spotify." in cand.lower():
+                cand = cand.split(".", 1)[-1].strip()
+            artist = cand
+    if not title or not artist:
+        m_t = re.search(r"<title[^>]*>([\s\S]*?)</title>", page_html, re.IGNORECASE)
+        if m_t:
+            raw_t = html.unescape(re.sub(r"\s+", " ", m_t.group(1)).strip())
+            raw_t = re.sub(r"\s*\|\s*Spotify\s*$", "", raw_t, flags=re.IGNORECASE)
+            m_by = re.match(
+                r"^(?P<song>.+?)\s*-\s*(?:song(?:\s+and\s+lyrics)?|single|album|playlist|episode)\s+by\s+(?P<art>.+)$",
+                raw_t,
+                re.IGNORECASE,
+            )
+            if m_by:
+                title = title or m_by.group("song").strip()
+                artist = artist or m_by.group("art").strip()
+            elif not title:
+                title = raw_t
+    if not title:
+        return None
+    dur_secs = None
+    if dur_raw and dur_raw.isdigit():
+        dur_secs = float(dur_raw)
+    return {"title": title, "artist": artist or "", "duration_secs": dur_secs}
+
+
+def resolve_spotify_metadata(url):
+    """Resolve public track/album/playlist metadata from a Spotify link (no DRM touched)."""
+    m = _SPOTIFY_URL_RE.search(url or "")
+    if not m:
+        return None
+    item_type, item_id = m.group(1).lower(), m.group(2)
+    canonical = f"https://open.spotify.com/{item_type}/{item_id}"
+    embed_url = f"https://open.spotify.com/embed/{item_type}/{item_id}"
+
+    # 1. Public Spotify embed JSON (carries exact title + artist + duration + playlist lead track)
+    try:
+        embed_html = _http_fetch_text(embed_url)
+        meta = _parse_spotify_embed_json(embed_html)
+        if meta and meta.get("title"):
+            meta["canonical_url"] = canonical
+            meta["item_type"] = item_type
+            return meta
+    except Exception:
+        pass
+
+    # 2. Public Spotify oEmbed + page OpenGraph fallback
+    oembed_title = ""
+    try:
+        oembed_raw = _http_fetch_text(
+            "https://open.spotify.com/oembed?url=" + urllib.parse.quote(canonical, safe="")
+        )
+        oembed_json = json.loads(oembed_raw)
+        oembed_title = html.unescape(str(oembed_json.get("title") or "").strip())
+    except Exception:
+        oembed_title = ""
+
+    try:
+        page_html = _http_fetch_text(canonical)
+        meta = _parse_spotify_html_meta(page_html)
+        if meta and meta.get("title"):
+            meta["canonical_url"] = canonical
+            meta["item_type"] = item_type
+            return meta
+    except Exception:
+        pass
+
+    if oembed_title:
+        return {
+            "title": oembed_title,
+            "artist": "",
+            "duration_secs": None,
+            "canonical_url": canonical,
+            "item_type": item_type,
+        }
+    raise RuntimeError(
+        "Could not read track metadata from that Spotify link. Make sure the Spotify "
+        "track or playlist is public and try again."
+    )
+
+
+def _is_spotify_url(url):
+    return bool(_SPOTIFY_URL_RE.search(url or ""))
+
+
+def _is_soundcloud_url(url):
+    try:
+        host = (urllib.parse.urlsplit(url or "").hostname or "").lower()
+    except Exception:
+        return False
+    return host in _SOUNDCLOUD_HOSTS or host.endswith(".soundcloud.com")
+
+
 def _safe_name(name, ext):
-    """Turn a media title into a filesystem-safe attachment filename."""
-    base = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", name or "").strip()
-    base = base[:60].strip() or "download"
+    """Turn a media title into a clean, filesystem-safe attachment filename."""
+    base = clean_export_stem(name, fallback="download")
     return f"{base}.{ext}"
+
+
+def _clear_partial_downloads(out_dir):
+    for f in glob.glob(os.path.join(out_dir, "download.*")):
+        try:
+            os.remove(f)
+        except OSError:
+            pass
 
 
 def _find_output(out_dir):
@@ -2051,20 +2601,23 @@ def _shrink(path, max_bytes, kind):
     ext = os.path.splitext(path)[1].lower()
     out = os.path.splitext(path)[0] + "_small" + ext
     if kind == "audio":
-        plans = [["-vn", "-codec:a", "libmp3lame", "-b:a", br] for br in ("128k", "96k", "64k")]
+        plans = [
+            _CLEAN_MP3_FLAGS + ["-vn", "-codec:a", "libmp3lame", "-b:a", br]
+            for br in ("128k", "96k", "64k")
+        ]
     else:
         plans = [[
-            "-vf", f"scale=-2:{h}", "-c:v", "libx264", "-preset", "veryfast",
-            "-crf", crf, "-c:a", "aac", "-b:a", "128k",
+            "-map_metadata", "-1", "-vf", f"scale=-2:{h}", "-c:v", "libx264",
+            "-preset", "veryfast", "-crf", crf, "-c:a", "aac", "-b:a", "128k",
         ] for h, crf in (("480", "28"), ("360", "30"), ("240", "30"))]
     for plan in plans:
-        args = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", path] + plan + [out]
+        args = _FFMPEG + ["-i", path] + plan + [out]
         try:
             p = subprocess.run(
                 args, capture_output=True, text=True, timeout=150,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0)
             if p.returncode == 0 and os.path.isfile(out) and os.path.getsize(out) <= max_bytes:
-                os.replace(out, path)   # keep the original filename, swap the content
+                os.replace(out, path)
                 return path
         except Exception:
             pass
@@ -2076,46 +2629,266 @@ def _shrink(path, max_bytes, kind):
     return None
 
 
-def download_media(url, out_dir, kind="audio", max_bytes=_DISCORD_MAX_BYTES):
-    """Download a video/audio URL via the yt-dlp CLI into out_dir.
+def _format_duration_display(raw_dur):
+    """Format seconds or string duration neatly as M:SS when numeric."""
+    if raw_dur is None:
+        return "—"
+    s = str(raw_dur).strip()
+    if not s or s.upper() == "NA":
+        return "—"
+    try:
+        secs = int(round(float(s)))
+        if secs > 0:
+            return f"{secs // 60}:{secs % 60:02d}"
+    except (TypeError, ValueError):
+        pass
+    return s
 
-    kind='audio' extracts the best audio as mp3; kind='video' grabs the best
-    <=720p stream and merges it to mp4. Returns a dict with the media title,
-    duration, uploader, source url, local path, size and any shrink note.
-    Raises RuntimeError if yt-dlp can't read or download the link.
+
+def download_media(url, out_dir, kind="audio", max_bytes=_DISCORD_MAX_BYTES):
+    """Download playable audio/video for a URL (including Spotify & SoundCloud) via yt-dlp.
+
+    Spotify streams use Widevine DRM and are never decrypted or ripped; instead,
+    Spotify links resolve public track/artist metadata and fetch matching playable
+    audio via yt-dlp search (YouTube / SoundCloud fallback). SoundCloud short links,
+    mobile links, tracks, and sets are normalized and downloaded with SoundCloud-safe
+    format selection.
     """
     ytdlp = _ytdlp_bin()
-    if not url or not str(url).strip().lower().startswith(("http://", "https://")):
+    norm_url = _normalize_download_url(url)
+    if not norm_url or not norm_url.lower().startswith(("http://", "https://")):
         raise RuntimeError("That doesn't look like a URL (needs http:// or https://).")
 
-    # Let yt-dlp find ffmpeg explicitly (it needs it to extract/merge audio video).
-    # YouTube's default client frequently answers the bestaudio/media request with
-    # HTTP 403 (throttling); the android / web_embedded players are allowed and
-    # download fine, so pin those. They only apply to the youtube extractor, so
-    # non-YouTube links are unaffected.
-    base = [ytdlp, "--no-warnings", "--no-playlist",
-            "--extractor-args", "youtube:player_client=android,web_embedded"]
-    # Cookies let gated / region-locked / bot-protected pages work when the user
-    # enables them (see _cookies_args). Real DRM still refuses -- that is intended.
-    base += _cookies_args()
-    ffmpeg = shutil.which("ffmpeg")
-    if ffmpeg:
-        base += ["--ffmpeg-location", os.path.dirname(ffmpeg)]
+    ffmpeg_loc = []
+    if _FFMPEG_BIN and os.path.isfile(_FFMPEG_BIN):
+        ffmpeg_loc = ["--ffmpeg-location", _FFMPEG_BIN]
+    else:
+        ff_which = shutil.which("ffmpeg")
+        if ff_which:
+            ffmpeg_loc = ["--ffmpeg-location", ff_which]
 
-    # Relaxed flags used as a second attempt, for pages that block the default
-    # client or serve a self-signed cert. Harmless when the first pass succeeds.
-    relaxed = ["--user-agent", UA, "--no-check-certificate",
-               "--extractor-retries", "3", "--retries", "3"]
+    cookies = _cookies_args()
+    relaxed = [
+        "--user-agent", UA, "--no-check-certificate",
+        "--extractor-retries", "3", "--retries", "3",
+    ]
+    out_tmpl = os.path.join(out_dir, "download.%(ext)s")
+
+    def _finalize_result(title, duration, uploader, webpage_url, note=""):
+        path = _find_output(out_dir)
+        if kind == "audio":
+            strip_audio_metadata(path)
+        if os.path.getsize(path) > max_bytes:
+            if _shrink(path, max_bytes, kind):
+                note = (f"{note} " if note else "") + "Compressed to fit Discord's file-size limit."
+            else:
+                note = (
+                    (f"{note} " if note else "")
+                    + f"Final file is {os.path.getsize(path) / 1e6:.1f} MB, "
+                    "larger than Discord's attachment limit."
+                )
+        if kind == "audio":
+            strip_audio_metadata(path)
+        ext = os.path.splitext(path)[1].lstrip(".") or "mp3"
+        final = os.path.join(out_dir, _safe_name(title, ext))
+        if os.path.abspath(path) != os.path.abspath(final):
+            os.replace(path, final)
+            path = final
+        return {
+            "title": title or os.path.basename(path),
+            "duration": _format_duration_display(duration),
+            "uploader": uploader or "—",
+            "webpage_url": webpage_url,
+            "path": path,
+            "size": os.path.getsize(path),
+            "ext": ext,
+            "kind": kind,
+            "note": note.strip(),
+        }
+
+    # ---- Branch 1: Spotify link -> metadata lookup + yt-dlp search -----------
+    if _is_spotify_url(norm_url):
+        meta = resolve_spotify_metadata(norm_url)
+        sp_title = meta["title"]
+        sp_artist = meta.get("artist") or ""
+        sp_dur = meta.get("duration_secs")
+        display_title = f"{sp_artist} - {sp_title}" if sp_artist else sp_title
+        base_query = f"{sp_artist} - {sp_title}".strip(" -") if sp_artist else sp_title
+
+        search_targets = []
+        if kind == "audio":
+            if sp_dur and sp_dur >= 25:
+                lo = max(15, int(sp_dur - 45))
+                hi = int(sp_dur + 90)
+                search_targets.append((
+                    f"ytsearch3:{base_query} official audio",
+                    ["--playlist-items", "1:3", "--max-downloads", "1",
+                     "--match-filter", f"duration >= {lo} & duration <= {hi}"],
+                    True,
+                ))
+            search_targets.append((f"ytsearch1:{base_query} audio", ["--no-playlist"], True))
+            search_targets.append((f"scsearch1:{base_query}", ["--no-playlist"], False))
+        else:
+            search_targets.append((f"ytsearch1:{base_query}", ["--no-playlist"], True))
+
+        last_err = ""
+        for target, extra_flags, is_yt in search_targets:
+            _clear_partial_downloads(out_dir)
+            cmd = [ytdlp, "--no-warnings", "--no-embed-metadata"] + extra_flags
+            if is_yt:
+                cmd += ["--extractor-args", "youtube:player_client=android,web_embedded"]
+            cmd += cookies + ffmpeg_loc
+            if kind == "audio":
+                dl = cmd + ["-x", "--audio-format", "mp3", "--audio-quality", "0",
+                            "-o", out_tmpl, target]
+            else:
+                dl = cmd + ["-f", "bv*[height<=720]+ba/b[height<=720]",
+                            "--merge-output-format", "mp4", "-o", out_tmpl, target]
+            rc, _out, err = _run_yt(dl, timeout=240)
+            # Note: --max-downloads 1 exits with code 101 in yt-dlp after writing the file!
+            if rc not in (0, 101):
+                rc, _out, err = _run_yt(dl + relaxed, timeout=240)
+            try:
+                if os.path.isfile(_find_output(out_dir)):
+                    actual_dur = sp_dur
+                    if not actual_dur:
+                        try:
+                            actual_dur = _duration_seconds(_find_output(out_dir))
+                        except Exception:
+                            actual_dur = None
+                    return _finalize_result(
+                        display_title,
+                        actual_dur,
+                        sp_artist or "Spotify",
+                        meta.get("canonical_url") or norm_url,
+                    )
+            except RuntimeError:
+                pass
+            last_err = err or last_err
+
+        hint = _err_hint(last_err)
+        raise RuntimeError(
+            f"Could not download playable audio for Spotify track '{display_title}'."
+            + (f" {last_err.strip()}" if last_err.strip() else "")
+            + (f"\n{hint}" if hint else "")
+        )
+
+    # ---- Branch 2: SoundCloud link -------------------------------------------
+    if _is_soundcloud_url(norm_url):
+        parsed_sc = urllib.parse.urlsplit(norm_url)
+        is_sc_set = "/sets/" in (parsed_sc.path or "").lower() and "in=" not in (parsed_sc.query or "")
+        playlist_flags = ["--playlist-items", "1"] if is_sc_set else ["--no-playlist"]
+        sc_base = [ytdlp, "--no-warnings", "--no-embed-metadata"] + playlist_flags + cookies + ffmpeg_loc
+
+        rc, out, err = _run_yt(
+            sc_base + ["--skip-download", "--print", "%(title)s\t%(duration)s\t%(uploader)s", norm_url],
+            timeout=60,
+        )
+        if rc != 0:
+            rc, out, err = _run_yt(
+                sc_base + relaxed + ["--skip-download", "--print", "%(title)s\t%(duration)s\t%(uploader)s", norm_url],
+                timeout=60,
+            )
+        first_line = (out.strip().splitlines() or [""])[0]
+        parts = (first_line.split("\t") + ["", "", ""])[:3]
+        title, duration, uploader = parts[0], parts[1], parts[2]
+
+        if rc == 0:
+            _clear_partial_downloads(out_dir)
+            if kind == "audio":
+                dl = sc_base + [
+                    "-f", "http_mp3_1_0/hls_mp3_1_0/bestaudio/best",
+                    "-x", "--audio-format", "mp3", "--audio-quality", "0",
+                    "-o", out_tmpl, norm_url,
+                ]
+            else:
+                dl = sc_base + [
+                    "-f", "bv*[height<=720]+ba/b[height<=720]/best",
+                    "--merge-output-format", "mp4", "-o", out_tmpl, norm_url,
+                ]
+            dl_rc, _dl_out, dl_err = _run_yt(dl, timeout=240)
+            if dl_rc != 0:
+                dl_rc, _dl_out, dl_err = _run_yt(dl + relaxed, timeout=240)
+            err = dl_err or err
+            if dl_rc == 0:
+                # Guard against 30s SoundCloud Go+ preview stubs when full track is on YT
+                out_file = _find_output(out_dir)
+                try:
+                    got_dur = _duration_seconds(out_file)
+                except Exception:
+                    got_dur = 0.0
+                if not (kind == "audio" and 28.0 <= got_dur <= 31.0 and title):
+                    return _finalize_result(title, duration or got_dur, uploader, norm_url)
+                # Try finding the full non-preview track if SoundCloud only served a 30s Go+ snippet
+                if title:
+                    fb_dir = os.path.join(out_dir, "_sc_full")
+                    os.makedirs(fb_dir, exist_ok=True)
+                    fb_tmpl = os.path.join(fb_dir, "download.%(ext)s")
+                    q = f"{uploader} - {title}".strip(" -") if uploader else title
+                    fb_cmd = (
+                        [ytdlp, "--no-warnings", "--no-playlist", "--no-embed-metadata",
+                         "--extractor-args", "youtube:player_client=android,web_embedded",
+                         "--match-filter", "duration >= 45"]
+                        + cookies + ffmpeg_loc
+                        + ["-x", "--audio-format", "mp3", "--audio-quality", "0",
+                           "-o", fb_tmpl, f"ytsearch1:{q} official audio"]
+                    )
+                    fb_rc, _, _ = _run_yt(fb_cmd, timeout=180)
+                    if fb_rc == 0:
+                        try:
+                            full_file = _find_output(fb_dir)
+                            full_dur = _duration_seconds(full_file)
+                            os.replace(full_file, out_file)
+                            return _finalize_result(title, full_dur, uploader, norm_url)
+                        except Exception:
+                            pass
+                return _finalize_result(title, duration or got_dur, uploader, norm_url)
+
+        # Fallback if SoundCloud blocked/geo-gated the track but we resolved or can infer title
+        slug_query = f"{uploader} - {title}".strip(" -") if title else ""
+        if not slug_query:
+            segs = [seg for seg in (parsed_sc.path or "").split("/") if seg and seg != "sets"]
+            if len(segs) >= 2:
+                slug_query = f"{segs[0].replace('-', ' ')} - {segs[-1].replace('-', ' ')}"
+        if slug_query and kind == "audio":
+            _clear_partial_downloads(out_dir)
+            fb_cmd = (
+                [ytdlp, "--no-warnings", "--no-playlist", "--no-embed-metadata",
+                 "--extractor-args", "youtube:player_client=android,web_embedded"]
+                + cookies + ffmpeg_loc
+                + ["-x", "--audio-format", "mp3", "--audio-quality", "0",
+                   "-o", out_tmpl, f"ytsearch1:{slug_query} audio"]
+            )
+            fb_rc, _, _ = _run_yt(fb_cmd, timeout=200)
+            if fb_rc == 0:
+                try:
+                    out_file = _find_output(out_dir)
+                    fb_dur = _duration_seconds(out_file)
+                    return _finalize_result(title or slug_query, fb_dur, uploader or "SoundCloud", norm_url)
+                except Exception:
+                    pass
+
+        hint = _err_hint(err)
+        raise RuntimeError(
+            "yt-dlp could not download that SoundCloud link."
+            + (f" {err.strip()}" if (err or "").strip() else "")
+            + (f"\n{hint}" if hint else "")
+        )
+
+    # ---- Branch 3: YouTube & general yt-dlp URLs -----------------------------
+    base = [
+        ytdlp, "--no-warnings", "--no-playlist", "--no-embed-metadata",
+        "--extractor-args", "youtube:player_client=android,web_embedded",
+    ] + cookies + ffmpeg_loc
 
     def _probe(cmd):
         return _run_yt(cmd, timeout=60)
 
-    # Phase A -- fast metadata probe (validates the link, gives us the title).
     rc, out, err = _probe(
-        base + ["--skip-download", "--print", "%(title)s\t%(duration)s\t%(uploader)s", url])
+        base + ["--skip-download", "--print", "%(title)s\t%(duration)s\t%(uploader)s", norm_url])
     if rc != 0:
         rc, out, err = _probe(
-            base + relaxed + ["--skip-download", "--print", "%(title)s\t%(duration)s\t%(uploader)s", url])
+            base + relaxed + ["--skip-download", "--print", "%(title)s\t%(duration)s\t%(uploader)s", norm_url])
     if rc != 0:
         hint = _err_hint(err)
         raise RuntimeError("yt-dlp could not read that link."
@@ -2124,14 +2897,13 @@ def download_media(url, out_dir, kind="audio", max_bytes=_DISCORD_MAX_BYTES):
     parts = (out.strip().split("\t") + ["", "", ""])[:3]
     title, duration, uploader = parts[0], parts[1], parts[2]
 
-    # Phase B -- the actual download into a fixed basename in out_dir.
-    out_tmpl = os.path.join(out_dir, "download.%(ext)s")
+    _clear_partial_downloads(out_dir)
     if kind == "audio":
         dl = base + ["-x", "--audio-format", "mp3", "--audio-quality", "0",
-                     "-o", out_tmpl, url]
+                     "-o", out_tmpl, norm_url]
     else:
         dl = base + ["-f", "bv*[height<=720]+ba/b[height<=720]",
-                     "--merge-output-format", "mp4", "-o", out_tmpl, url]
+                     "--merge-output-format", "mp4", "-o", out_tmpl, norm_url]
     rc, _out, err = _run_yt(dl, timeout=240)
     if rc != 0:
         rc, _out, err = _run_yt(dl + relaxed, timeout=240)
@@ -2141,29 +2913,5 @@ def download_media(url, out_dir, kind="audio", max_bytes=_DISCORD_MAX_BYTES):
                            + (f" {err.strip()}" if err.strip() else "")
                            + (f"\n{hint}" if hint else ""))
 
-    path = _find_output(out_dir)
-    note = ""
-    if os.path.getsize(path) > max_bytes:
-        if _shrink(path, max_bytes, kind):
-            note = "Compressed to fit Discord's file-size limit."
-        else:
-            note = (f"Final file is {os.path.getsize(path) / 1e6:.1f} MB, "
-                    "larger than Discord's attachment limit — you may need to trim it.")
+    return _finalize_result(title, duration, uploader, norm_url)
 
-    ext = os.path.splitext(path)[1].lstrip(".") or "download"
-    final = os.path.join(out_dir, _safe_name(title, ext))
-    if os.path.abspath(path) != os.path.abspath(final):
-        os.replace(path, final)
-        path = final
-
-    return {
-        "title": title or os.path.basename(path),
-        "duration": duration or "—",
-        "uploader": uploader or "—",
-        "webpage_url": url,
-        "path": path,
-        "size": os.path.getsize(path),
-        "ext": ext,
-        "kind": kind,
-        "note": note,
-    }

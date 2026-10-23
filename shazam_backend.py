@@ -38,7 +38,10 @@ import threading
 import time
 
 import aiohttp
-from shazamio import Shazam
+try:
+    from shazamio import Shazam
+except ImportError:
+    Shazam = None
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(HERE, "lookup_config.json")
@@ -261,7 +264,15 @@ class AudioRecognition:
         }
 
     async def _recognize_once(self, path, cfg):
-        shazam = Shazam(
+        shazam_cls = Shazam
+        if shazam_cls is None:
+            try:
+                from shazamio import Shazam as shazam_cls  # noqa: PLC0415
+            except ImportError as exc:
+                raise RuntimeError(
+                    f"ShazamIO is not installed (pip install shazamio): {exc}"
+                ) from exc
+        shazam = shazam_cls(
             language=cfg.get("language", "en-US"),
             endpoint_country=cfg.get("endpoint_country", "US"),
         )
@@ -273,7 +284,9 @@ class AudioRecognition:
         finally:
             close = getattr(shazam, "close", None)
             if callable(close):
-                close()
+                res = close()
+                if asyncio.iscoroutine(res):
+                    await res
         return self._parse_track(data)
 
     async def recognize(self, path, progress=None):

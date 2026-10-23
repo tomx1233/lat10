@@ -75,7 +75,12 @@ assert all(b < a + 12.0 for a, b in zip(wg, wg[1:])), wg   # overlapping, not ab
 print("1. windows OK:", w[:3], "... gapfree:", wg)
 
 # ---- 2. ShazamIO parse rules ---------------------------------------------
-import shazamio  # noqa: E402
+try:
+    import shazamio  # noqa: E402
+except ImportError:
+    import types as _types
+    shazamio = _types.ModuleType("shazamio")
+    sys.modules["shazamio"] = shazamio
 
 class FakeShazam:
     answer = {}

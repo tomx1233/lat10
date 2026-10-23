@@ -364,17 +364,21 @@ def _advertise_fields(embed):
 
 
 def _whitelist_dm_embed():
-    """Private message sent to a user who is newly whitelisted."""
+    """Private message sent to a user who has been whitelisted."""
     embed = discord.Embed(
         title="You've been verified",
         description=(
-            "You can now use **KILLA'S BOSS** as an app on your user account — "
-            "add it under Discord → User Settings → Apps, then run the slash "
-            "commands in a DM with the bot or in your own server."
+            "You can now use **KILLA'S BOSS** as an app on your Discord account.\n\n"
+            "Add it from the bot profile or under **Discord -> User Settings -> Apps**, "
+            "then run slash commands in a DM with the bot or in your own server."
         ),
         color=GREEN,
     )
-    _advertise_fields(embed)
+    embed.add_field(
+        name="Roblox Group",
+        value=f"[KILLA'S HUB 3.0]({_ADVERT_GROUP})",
+        inline=False,
+    )
     _brand_footer(embed, "staff whitelist")
     return embed
 
@@ -552,7 +556,11 @@ ANYWHERE_FREE_COMMANDS = {"copyr8"}
 def is_free_command(interaction: discord.Interaction) -> bool:
     """True when the command that was run is in the free-tool tier."""
     cmd = getattr(interaction, "command", None)
-    return cmd is not None and getattr(cmd, "name", None) in FREE_COMMANDS
+    if cmd is None:
+        return False
+    root = getattr(cmd, "root_parent", None)
+    name = getattr(root, "name", None) or getattr(cmd, "name", None)
+    return name in FREE_COMMANDS
 
 
 def _has_trusted_role(member: discord.Member) -> bool:
@@ -577,7 +585,11 @@ def _is_anywhere_free_command(interaction: discord.Interaction) -> bool:
     """True when the command is one of ANYWHERE_FREE_COMMANDS -- the free-tool
     commands the trusted tier may also run outside the primary server."""
     cmd = getattr(interaction, "command", None)
-    return cmd is not None and getattr(cmd, "name", None) in ANYWHERE_FREE_COMMANDS
+    if cmd is None:
+        return False
+    root = getattr(cmd, "root_parent", None)
+    name = getattr(root, "name", None) or getattr(cmd, "name", None)
+    return name in ANYWHERE_FREE_COMMANDS
 
 
 async def _outside_primary_trusted(user_id: int) -> bool:
@@ -673,17 +685,37 @@ def in_commands_channel(interaction: discord.Interaction) -> bool:
     return channel.name.lower() == COMMAND_CHANNEL
 
 
-def _read_staff_whitelist() -> set:
+def _read_staff_whitelist_doc() -> dict:
     try:
         with open(STAFF_WHITELIST_FILE, encoding="utf-8") as f:
             data = json.load(f)
-        return {int(x) for x in (data.get("user_ids", []) or [])}
+        return data if isinstance(data, dict) else {}
     except (FileNotFoundError, ValueError, TypeError):
+        return {}
+
+
+def _read_staff_whitelist() -> set:
+    data = _read_staff_whitelist_doc()
+    try:
+        return {int(x) for x in (data.get("user_ids", []) or [])}
+    except (ValueError, TypeError):
         return set()
 
 
-def _write_staff_whitelist(user_ids: set):
+def _read_pending_whitelist_dms() -> set:
+    data = _read_staff_whitelist_doc()
+    try:
+        return {int(x) for x in (data.get("pending_dm_ids", []) or [])}
+    except (ValueError, TypeError):
+        return set()
+
+
+def _write_staff_whitelist(user_ids: set, pending_dm_ids: set = None):
+    if pending_dm_ids is None:
+        pending_dm_ids = _read_pending_whitelist_dms() & set(user_ids)
     data = {"user_ids": sorted(user_ids)}
+    if pending_dm_ids:
+        data["pending_dm_ids"] = sorted(pending_dm_ids)
     with open(STAFF_WHITELIST_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
 
@@ -691,14 +723,19 @@ def _write_staff_whitelist(user_ids: set):
 async def _resolve_whitelist_target(interaction, user, user_id):
     """Return (uid, discord_user_or_None, error_or_None) for /whitelist.
 
-    A resolved `user` (mention) wins; otherwise `user_id` (a raw id string)
-    is parsed and looked up via fetch_user. A failed lookup is NOT an error
-    here -- callers that need the user object (add + DM) check for None, so
-    `remove` can still work by id for accounts the bot can't fetch.
+    A resolved `user` (mention) wins; otherwise `user_id` (a raw id string or
+    pasted `<@id>` mention) is parsed and looked up via guild/client cache and
+    fetch_user. A failed lookup is NOT an error here -- callers that need the
+    user object (add + DM) check for None, so `remove` can still work by id for
+    accounts the bot can't fetch.
     """
     if user is not None:
         return user.id, user, None
-    raw = (user_id or "").strip()
+    raw = (user_id or "").strip().strip("`").strip()
+    if raw.startswith("<@") and raw.endswith(">"):
+        raw = raw[2:-1].lstrip("!&").strip()
+    elif raw.startswith("@"):
+        raw = raw[1:].strip()
     if not raw:
         return None, None, None
     if not raw.isdigit():
@@ -706,6 +743,18 @@ async def _resolve_whitelist_target(interaction, user, user_id):
             "`user_id` must be a number, e.g. "
             "`/whitelist add user_id: 123456789012345678`.")
     uid = int(raw)
+    guild = getattr(interaction, "guild", None)
+    if guild is not None:
+        get_member = getattr(guild, "get_member", None)
+        if callable(get_member):
+            cached_m = get_member(uid)
+            if cached_m is not None:
+                return uid, cached_m, None
+    get_user = getattr(interaction.client, "get_user", None)
+    if callable(get_user):
+        cached_u = get_user(uid)
+        if cached_u is not None:
+            return uid, cached_u, None
     try:
         return uid, await interaction.client.fetch_user(uid), None
     except Exception:
@@ -1152,11 +1201,12 @@ def _copyr8_pacing_line(status):
     rl = status.get("rate_limit_remaining") or 0.0
     if rl > 0.0:
         streak = status.get("consecutive_limits") or 0
-        return (f"\u23f3 Shazam rate limit -- cool-down resets in **{_format_wait(rl)}**"
+        return (f"\u23f3 Shazam rate limit (API Cooldown) -- cool-down resets in "
+                f"**{_format_wait(rl)}**"
                 + (f" (throttle #{streak} in a row)" if streak > 1 else ""))
     breath = status.get("breath_remaining") or 0.0
     if breath >= 0.5:
-        return (f"\u23f1 API pacing -- next probe in **{breath:.1f}s** "
+        return (f"\u23f1 API pacing (API Cooldown) -- next probe in **{breath:.1f}s** "
                 f"(spacing {status.get('breath_seconds', 0.0):.1f}s)")
     return ""
 
@@ -1474,7 +1524,10 @@ class _MonitorSession:
         msg = self.dm_msgs.get(asset_id)
         if msg is not None:
             try:
-                await msg.edit(embed=embed, files=_fresh_files(files))
+                if files is not None:
+                    await msg.edit(embed=embed, attachments=_fresh_files(files))
+                else:
+                    await msg.edit(embed=embed)
                 return
             except Exception:  # noqa: BLE001
                 self.dm_msgs[asset_id] = None
@@ -1555,6 +1608,7 @@ class _MonitorSession:
         finally:
             if active_monitors.get(asset_id) is task:
                 active_monitors.pop(asset_id, None)
+                _watcher_display.pop(asset_id, None)
                 _log(f"monitor {asset_id}: ended (slot freed)")
 
     async def _final(self, asset_id, st, prev):
@@ -1628,27 +1682,71 @@ async def monitor_slash(interaction: discord.Interaction, asset: str):
     if not await _require_trusted(interaction):
         return
     if not killa_tools.ROBLOX_COOKIE:
-        await interaction.response.send_message(
-            "no Roblox cookie detected (set ROBLOX_COOKIE in .env)", ephemeral=True)
+        embed = discord.Embed(
+            title="Roblox Session Required",
+            description="No `ROBLOX_COOKIE` is configured in `.env`. Add a valid `.ROBLOSECURITY` session cookie to monitor moderation states.",
+            color=RED,
+        )
+        _brand_footer(embed, "moderation monitor")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
         return
 
     token = (asset or "").strip().lower()
 
-    # Control sub-commands so you can run several watchers and manage them.
+    # /monitor list -- active watchers overview card
     if token in ("list", "list_"):
         if not active_monitors:
-            await interaction.response.send_message(
-                "no assets are being monitored right now.", ephemeral=True)
+            embed = discord.Embed(
+                title="Active Moderation Watchers",
+                description="No Roblox audio assets are currently being monitored.\n\nStart watching one or more IDs with `/monitor <id...>`.",
+                color=PURPLE,
+            )
+            _brand_footer(embed, "moderation monitor")
+            await interaction.response.send_message(embed=embed, ephemeral=True)
             return
-        lines = [f"`{aid}` ({_watcher_display.get(aid, 'asset')})" for aid in sorted(active_monitors)]
-        await interaction.response.send_message(
-            "**Monitoring right now:**\n" + "\n".join(lines), ephemeral=True)
+        lines = [
+            f"• `{aid}` — **{_watcher_display.get(aid, 'Audio Asset')}** "
+            f"([Library](https://www.roblox.com/library/{aid}))"
+            for aid in sorted(active_monitors)
+        ]
+        embed = discord.Embed(
+            title="Active Moderation Watchers",
+            description="\n".join(lines)[:4000],
+            color=PURPLE,
+        )
+        embed.add_field(name="Active Count", value=str(len(active_monitors)), inline=True)
+        embed.add_field(
+            name="Poll Interval",
+            value=f"Every {int(MONITOR_INTERVAL_SECONDS)}s",
+            inline=True,
+        )
+        _brand_footer(embed, "moderation monitor")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
         return
-    if token.startswith("stop "):
-        targets = _split_ids((asset or "").strip()[5:])
+
+    # /monitor stop <id...|all>
+    if token == "stop" or token.startswith("stop "):
+        raw_rest = (asset or "").strip()[4:].strip()
+        if raw_rest.lower() == "all":
+            targets = list(sorted(active_monitors))
+        else:
+            targets = []
+            for item in _split_ids(raw_rest):
+                try:
+                    targets.append(str(verify_audio.extract_asset_id(item)))
+                except verify_audio.AssetError:
+                    targets.append(item)
         if not targets:
-            await interaction.response.send_message(
-                "pass one or more ids, e.g. `stop 123 456`.", ephemeral=True)
+            embed = discord.Embed(
+                title="Specify Watchers to Stop",
+                description=(
+                    "Pass one or more asset IDs (or `all`) after `stop`, for example:\n"
+                    "`/monitor stop 123456789 987654321` or `/monitor stop all`."
+                ),
+                color=RED,
+            )
+            _brand_footer(embed, "moderation monitor")
+            await interaction.response.send_message(embed=embed, ephemeral=True)
             return
         stopped, missing = [], []
         for t in targets:
@@ -1656,21 +1754,27 @@ async def monitor_slash(interaction: discord.Interaction, asset: str):
             if task:
                 task.cancel()
                 active_monitors.pop(t, None)
-                _watcher_display.pop(t, None)
-                stopped.append(f"`{t}`")
+                disp = _watcher_display.pop(t, None)
+                stopped.append(f"`{t}`" + (f" ({disp})" if disp else ""))
             else:
                 missing.append(f"`{t}`")
-        msg = []
+        embed = discord.Embed(
+            title="Moderation Monitor Updated",
+            description=(
+                f"Stopped **{len(stopped)}** watcher(s)."
+                if stopped else "None of the specified asset IDs had an active watcher."
+            ),
+            color=PURPLE if stopped else RED,
+        )
         if stopped:
-            msg.append("stopped monitoring " + ", ".join(stopped) + ".")
+            embed.add_field(name="Stopped", value=", ".join(stopped)[:1024], inline=False)
         if missing:
-            msg.append("not monitoring " + ", ".join(missing) + ".")
-        await interaction.response.send_message(
-            " ".join(msg) or "no targets.", ephemeral=True)
+            embed.add_field(name="Not Active", value=", ".join(missing)[:1024], inline=False)
+        _brand_footer(embed, "moderation monitor")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
         return
 
-    # Subscribe: comma/space/semicolon separated ids in one call, e.g.
-    # `/monitor 123 456` or `/monitor 123,456,789`.
+    # Subscribe: comma/space/semicolon separated ids in one call
     ids, bad = [], []
     for t in _split_ids(asset or ""):
         try:
@@ -1679,15 +1783,27 @@ async def monitor_slash(interaction: discord.Interaction, asset: str):
             bad.append(f"`{t}`")
     if not ids:
         if bad:
-            await interaction.response.send_message(
-                "couldn't read asset ids from: " + ", ".join(bad), ephemeral=True)
+            embed = discord.Embed(
+                title="Invalid Asset ID",
+                description="Could not extract a valid Roblox asset ID from: " + ", ".join(bad),
+                color=RED,
+            )
         else:
-            await interaction.response.send_message(
-                "pass one or more audio asset ids, e.g. `/monitor 123 456` "
-                "or `/monitor 123,456`.", ephemeral=True)
+            embed = discord.Embed(
+                title="Moderation Monitor Usage",
+                description=(
+                    "Pass one or more Roblox audio asset IDs or URLs:\n"
+                    "• `/monitor 123456789 987654321`\n"
+                    "• `/monitor list`\n"
+                    "• `/monitor stop 123456789`"
+                ),
+                color=PURPLE,
+            )
+        _brand_footer(embed, "moderation monitor")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
         return
 
-    await interaction.response.defer(thinking=True)
+    await interaction.response.defer(thinking=True, ephemeral=True)
     channel = getattr(interaction, "channel", None)
     user = interaction.user
     session = _MonitorSession(user, channel)
@@ -1706,27 +1822,41 @@ async def monitor_slash(interaction: discord.Interaction, asset: str):
         display = st.get("display_name")
         description = st.get("description")
         if _is_final_state(initial_state):
-            # Already decided: resolve it now (the detailed card goes to the DMs
-            # and the counts update the board) but DON'T spawn a watcher -- there
-            # is nothing left to watch.
             await session.start(asset_id, initial_state, display, description)
-            decided.append(f"`{asset_id}` (**{initial_state}**)")
+            decided.append(f"`{asset_id}` — **{display}** (`{initial_state}`)")
             continue
         _watcher_display[asset_id] = st["display_name"]
         await session.start(asset_id, initial_state, st["display_name"], st.get("description") or "")
-        started.append(f"`{asset_id}` ({st['display_name']})")
+        started.append(f"`{asset_id}` — **{st['display_name']}** (`{initial_state}`)")
 
-    summary = []
+    any_ok = bool(started or decided)
+    summary_embed = discord.Embed(
+        title="Moderation Monitor",
+        description=(
+            f"Tracking **{len(started)}** pending asset(s)."
+            if started else
+            f"Checked **{len(decided)}** already-decided asset(s)."
+            if decided else
+            "No new watchers were started."
+        ),
+        color=PURPLE if any_ok or skipped else RED,
+    )
     if started:
-        summary.append(" Watching " + ", ".join(started) + ".")
-    if skipped:
-        summary.append("Already watching (skipped): " + ", ".join(skipped) + ".")
+        summary_embed.add_field(name="Watching", value="\n".join(started)[:1024], inline=False)
     if decided:
-        summary.append("Already decided: " + ", ".join(decided) + ".")
+        summary_embed.add_field(name="Already Decided", value="\n".join(decided)[:1024], inline=False)
+    if skipped:
+        summary_embed.add_field(name="Already Active", value=", ".join(skipped)[:1024], inline=False)
     if failed:
-        summary.append("Not started: " + ", ".join(failed) + ".")
-    await interaction.followup.send(
-        "\n".join(summary) if summary else "nothing started.", ephemeral=True)
+        summary_embed.add_field(name="Could Not Start", value="\n".join(failed)[:1024], inline=False)
+    if any_ok:
+        summary_embed.add_field(
+            name="Updates",
+            value="Full status cards and audio previews are sent to your DMs as states update.",
+            inline=False,
+        )
+    _brand_footer(summary_embed, "moderation monitor")
+    await interaction.followup.send(embed=summary_embed, ephemeral=True)
 
 
 @bot.tree.command(
@@ -1799,12 +1929,43 @@ def _audio_embed(title, filename, info, note=None, image="waveform.png", tag="au
     return embed
 
 
-@bot.tree.command(
+def _analyze_roblox_warning_embed(asset_id, meta=None, reason=None):
+    """Basic warning card shown when a Roblox audio asset cannot be downloaded."""
+    embed = discord.Embed(
+        title="Warning: Cannot Download Audio",
+        description=f"Warning: Roblox audio asset `{asset_id}` could not be downloaded.",
+        color=RED,
+    )
+    if meta:
+        if meta.get("name"):
+            embed.add_field(name="Asset Name", value=str(meta["name"])[:256], inline=True)
+        if meta.get("creator"):
+            embed.add_field(name="Creator", value=str(meta["creator"])[:256], inline=True)
+        if meta.get("asset_type"):
+            embed.add_field(name="Type", value=str(meta["asset_type"])[:128], inline=True)
+    if reason:
+        embed.add_field(name="Details", value=str(reason)[:512], inline=False)
+    embed.add_field(
+        name="Link",
+        value=f"https://www.roblox.com/library/{asset_id}",
+        inline=False,
+    )
+    _brand_footer(embed, "audio analysis")
+    return embed
+
+
+analyze_group = app_commands.Group(
     name="analyze",
-    description="Analyze an audio file: loudness, waveform, format info.",
+    description="Analyze an uploaded audio file or a Roblox audio asset.",
+)
+
+
+@analyze_group.command(
+    name="file",
+    description="Analyze an uploaded audio file: loudness, waveform, format info.",
 )
 @app_commands.describe(file="The audio file to analyze.")
-async def analyze_slash(interaction: discord.Interaction, file: discord.Attachment):
+async def analyze_file_slash(interaction: discord.Interaction, file: discord.Attachment):
     if not await _require_trusted(interaction):
         return
     await interaction.response.defer(thinking=True)
@@ -1817,26 +1978,152 @@ async def analyze_slash(interaction: discord.Interaction, file: discord.Attachme
         info = await asyncio.to_thread(killa_tools.analyze_audio, input_path)
         wf = os.path.join(workdir, "waveform.png")
         await asyncio.to_thread(killa_tools.render_waveform, input_path, wf)
+        ext = (os.path.splitext(file.filename or "")[1].lstrip(".")
+               or _codec_ext(info.get("codec")))
+        clean_name = killa_tools._safe_name(file.filename or "audio", ext)
         try:
             await interaction.followup.send(
-                embed=_audio_embed("Audio Analysis", file.filename, info),
+                embed=_audio_embed("Audio Analysis", clean_name, info),
                 files=[discord.File(wf, filename="waveform.png"),
-                       discord.File(input_path, filename=file.filename)])
+                       discord.File(input_path, filename=clean_name)])
         except discord.HTTPException:
-            # The original audio can exceed Discord's upload limit (e.g. a long
-            # track); still post the analysis embed so the data isn't lost.
             await interaction.followup.send(
-                embed=_audio_embed("Audio Analysis", file.filename, info),
+                embed=_audio_embed("Audio Analysis", clean_name, info),
                 files=[discord.File(wf, filename="waveform.png")])
             await interaction.followup.send(
                 "the original file was too large to attach, so only the analysis is shown.",
                 ephemeral=True)
     except Exception as e:  # noqa: BLE001
-        _log(f"analyze failed for {interaction.user}: {e}\n"
+        _log(f"analyze file failed for {interaction.user}: {e}\n"
              + traceback.format_exc())
         await interaction.followup.send(f"analyze failed: {e}", ephemeral=True)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
+
+
+@analyze_group.command(
+    name="roblox",
+    description="Look up, download, and analyze a Roblox audio asset ID or URL.",
+)
+@app_commands.describe(
+    asset="Roblox audio asset ID or URL (e.g. 1848354536 or roblox.com/library/...).",
+)
+async def analyze_roblox_slash(interaction: discord.Interaction, asset: str):
+    if not await _require_trusted(interaction):
+        return
+    try:
+        asset_id = verify_audio.extract_asset_id(asset)
+    except verify_audio.AssetError as err:
+        embed = discord.Embed(
+            title="Invalid Roblox Asset ID",
+            description=str(err),
+            color=RED,
+        )
+        _brand_footer(embed, "audio analysis")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+
+    await interaction.response.defer(thinking=True)
+    workdir = tempfile.mkdtemp(prefix="kb_analyze_rbx_")
+    meta = None
+    try:
+        try:
+            meta = await asyncio.to_thread(killa_tools.lookup_roblox_asset, asset_id)
+        except Exception:
+            meta = {"id": asset_id, "name": f"Asset {asset_id}", "is_audio": True}
+
+        if not meta.get("is_audio", True):
+            warn = _analyze_roblox_warning_embed(
+                asset_id,
+                meta=meta,
+                reason=f"Asset `{asset_id}` is a {meta.get('asset_type') or 'non-audio'} asset, not Audio.",
+            )
+            await interaction.followup.send(embed=warn)
+            return
+
+        if meta.get("is_banned"):
+            warn = _analyze_roblox_warning_embed(
+                asset_id,
+                meta=meta,
+                reason="This asset was moderated or removed on Roblox.",
+            )
+            await interaction.followup.send(embed=warn)
+            return
+
+        try:
+            raw = await asyncio.to_thread(killa_tools.download_asset_audio, asset_id)
+        except Exception as dl_err:  # noqa: BLE001
+            warn = _analyze_roblox_warning_embed(asset_id, meta=meta, reason=str(dl_err))
+            await interaction.followup.send(embed=warn)
+            return
+
+        raw_path = os.path.join(workdir, "raw_audio")
+        with open(raw_path, "wb") as fh:
+            fh.write(raw)
+
+        try:
+            info = await asyncio.to_thread(killa_tools.analyze_audio, raw_path)
+            wf = os.path.join(workdir, "waveform.png")
+            await asyncio.to_thread(killa_tools.render_waveform, raw_path, wf)
+        except Exception as parse_err:  # noqa: BLE001
+            warn = _analyze_roblox_warning_embed(
+                asset_id,
+                meta=meta,
+                reason=f"Downloaded bytes could not be decoded as audio ({parse_err}).",
+            )
+            await interaction.followup.send(embed=warn)
+            return
+
+        ext = _codec_ext(info.get("codec"))
+        attach_name = killa_tools._safe_name(
+            meta.get("name") or f"audio_{asset_id}", ext
+        )
+        playable_path = os.path.join(workdir, attach_name)
+        shutil.copyfile(raw_path, playable_path)
+        await asyncio.to_thread(killa_tools.strip_audio_metadata, playable_path)
+
+        display_title = meta.get("name") or f"Asset {asset_id}"
+        embed = _audio_embed(
+            "Roblox Audio Analysis",
+            f"**{display_title}** (`{asset_id}`)",
+            info,
+        )
+        if meta.get("creator"):
+            embed.add_field(name="Creator", value=str(meta["creator"]), inline=True)
+        if meta.get("moderation_state"):
+            embed.add_field(name="Moderation", value=str(meta["moderation_state"]), inline=True)
+        embed.add_field(
+            name="Link",
+            value=f"https://www.roblox.com/library/{asset_id}",
+            inline=False,
+        )
+        try:
+            await interaction.followup.send(
+                embed=embed,
+                files=[
+                    discord.File(wf, filename="waveform.png"),
+                    discord.File(playable_path, filename=attach_name),
+                ],
+            )
+        except discord.HTTPException:
+            await interaction.followup.send(
+                embed=embed,
+                files=[discord.File(wf, filename="waveform.png")],
+            )
+            await interaction.followup.send(
+                "the audio file exceeded Discord's attachment limit, so only the analysis is shown.",
+                ephemeral=True,
+            )
+    except Exception as e:  # noqa: BLE001
+        _log(f"analyze roblox failed for {interaction.user}: {e}\n"
+             + traceback.format_exc())
+        warn = _analyze_roblox_warning_embed(asset_id, meta=meta, reason=str(e))
+        await interaction.followup.send(embed=warn)
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+bot.tree.add_command(analyze_group)
 
 
 @bot.tree.command(
@@ -1899,24 +2186,25 @@ async def copyr8_slash(interaction: discord.Interaction,
             ephemeral=True)
         return
 
-    await interaction.response.defer(thinking=True)
+    try:
+        await interaction.response.defer(thinking=True)
+    except Exception:
+        if is_autofit:
+            _copyr8_autofit_running = False
+        raise
     workdir = tempfile.mkdtemp(prefix="kb_copyr8_")
     try:
         input_path = await _save_attachment(workdir, file)
         output_path = os.path.join(workdir, "output.mp3")
         spec_path = os.path.join(workdir, "spectrogram.png")
-        # Export the processed copy under the source's own name + "_copyr8" so
-        # it is identifiable (e.g. "song.mp3" -> "song_copyr8.mp3").
-        out_stem = os.path.splitext(file.filename or "audio")[0] or "audio"
-        # Feeding a processed copy back in stacks a second shift and a second
-        # level drop on the first, which is how a "_copyr8_copyr8" file ends up
-        # far off the original. Name that pass apart from a first pass and say
-        # so in the reply, rather than appending another "_copyr8" and looking
-        # identical.
+        out_stem = killa_tools.clean_export_stem(file.filename or "audio", fallback="audio")
+        src_ext = os.path.splitext(file.filename or ".mp3")[1] or ".mp3"
+        clean_source_display = f"{out_stem}{src_ext}"
         base_stem, already_processed = out_stem, False
         while base_stem.lower().endswith("_copyr8"):
             base_stem = base_stem[:-len("_copyr8")]
             already_processed = True
+        base_stem = killa_tools.clean_export_stem(base_stem, fallback="audio")
         copyr8_name = f"{base_stem}_copyr8_2.mp3" if already_processed else f"{out_stem}_copyr8.mp3"
 
         if not is_autofit:
@@ -2013,11 +2301,11 @@ async def copyr8_slash(interaction: discord.Interaction,
                        "control check was inconclusive. The result is unverified.")
         embed = discord.Embed(
             title=f"{fit_label} Complete",
-            description=f"Processed **{file.filename}** with CopyR8 song checking."
+            description=f"Processed **{clean_source_display}** with CopyR8 song checking."
                         + ("\n\nThis file was already a processed copy, so this pass "
-                           "stacks a second shift and a second level drop on the "
-                           "first. Run it on the original track for a clean single "
-                           "pass." if already_processed else ""),
+                           "stacks a second shift on top of the first. Run it on the "
+                           "original track for a single pass."
+                           if already_processed else ""),
             color=PURPLE,
         )
         info = result.get("info") or {}
@@ -2075,10 +2363,8 @@ async def copyr8_slash(interaction: discord.Interaction,
         if is_v3 or is_v4:
             macro = result.get("macro") or {}
             if macro.get("applied"):
-                macro_val = ("the configured macro chain ran ("
-                             f"{len(macro.get('steps') or [])} steps"
-                             + (", metadata copied" if macro.get("metadata") else "")
-                             + ")")
+                macro_val = (f"configured macro chain ran "
+                             f"({len(macro.get('steps') or [])} steps)")
             else:
                 env_hint = "COPYR8_V4_MACRO" if is_v4 else "COPYR8_V3_MACRO"
                 macro_val = macro.get("reason") or f"not configured (set {env_hint})"
@@ -2524,6 +2810,146 @@ async def reload_slash(interaction: discord.Interaction):
     _restart_bot()
 
 
+def _whitelist_user_label(uid: int, target) -> str:
+    """Format a clickable `<@uid>` user tag with display/username context."""
+    mention = f"<@{uid}>"
+    if target is None:
+        return f"{mention} (`{uid}`)"
+    disp = getattr(target, "display_name", None) or getattr(target, "name", None)
+    uname = getattr(target, "name", None)
+    if disp and uname and disp.lower() != uname.lower():
+        return f"{mention} (**{disp}** · `@{uname}`)"
+    if disp:
+        return f"{mention} (**{disp}**)"
+    return mention
+
+
+async def _send_whitelist_dm(interaction, uid: int, target) -> tuple:
+    """Deliver the verification DM reliably and return (ok: bool, detail: str).
+
+    1. Searches shared guilds (cache + fetch_member) so Discord routes the DM
+       through a mutual-server member relationship whenever one exists.
+    2. Falls back to a fresh `client.fetch_user(uid)` / `target` and explicitly
+       opens the DM channel via `create_dm()` before sending.
+    3. Logs exact Discord HTTP/JSON error codes and distinguishes 50007 (no
+       mutual server yet vs server DMs disabled) from transient errors.
+    """
+    client = getattr(interaction, "client", None)
+    shared_member = None
+    seen_guilds = set()
+    candidate_guilds = []
+    cur_guild = getattr(interaction, "guild", None)
+    if cur_guild is not None:
+        candidate_guilds.append(cur_guild)
+    for g in getattr(client, "guilds", []) or []:
+        if g is not None:
+            candidate_guilds.append(g)
+
+    for g in candidate_guilds:
+        gid = getattr(g, "id", None)
+        if gid is not None:
+            if gid in seen_guilds:
+                continue
+            seen_guilds.add(gid)
+        get_m = getattr(g, "get_member", None)
+        m = get_m(uid) if callable(get_m) else None
+        if m is None:
+            fetch_m = getattr(g, "fetch_member", None)
+            if callable(fetch_m):
+                try:
+                    m = await fetch_m(uid)
+                except Exception:
+                    m = None
+        if m is not None:
+            shared_member = m
+            break
+
+    fresh_user = None
+    if shared_member is None and client is not None and hasattr(client, "fetch_user"):
+        try:
+            fresh_user = await client.fetch_user(uid)
+        except Exception:
+            fresh_user = None
+
+    recipients = []
+    for cand in (shared_member, fresh_user, target):
+        if cand is not None and cand not in recipients:
+            recipients.append(cand)
+
+    embed = _whitelist_dm_embed()
+    last_exc = None
+    for attempt in range(2):
+        for recipient in recipients:
+            try:
+                create_dm = getattr(recipient, "create_dm", None)
+                if callable(create_dm):
+                    dm_channel = await create_dm()
+                    await dm_channel.send(embed=embed)
+                else:
+                    await recipient.send(embed=embed)
+                _log(f"whitelist DM delivered to user id {uid}")
+                return True, ""
+            except discord.Forbidden as exc:
+                last_exc = exc
+                code = getattr(exc, "code", None)
+                _log(f"whitelist DM forbidden for {uid} (code={code}, "
+                     f"shared_guild={shared_member is not None}): {exc}")
+                break
+            except discord.HTTPException as exc:
+                last_exc = exc
+                status = getattr(exc, "status", None)
+                code = getattr(exc, "code", None)
+                _log(f"whitelist DM HTTP error for {uid} (status={status}, code={code}): {exc}")
+                if status and status < 500 and status != 429:
+                    break
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                _log(f"whitelist DM error for {uid}: {exc}")
+        if isinstance(last_exc, discord.Forbidden):
+            break
+        if attempt == 0:
+            await asyncio.sleep(0.8)
+
+    code = getattr(last_exc, "code", None)
+    if code == 50007 or isinstance(last_exc, discord.Forbidden):
+        if shared_member is None:
+            return False, (
+                "Discord blocks bots from starting a brand-new DM when the user does not "
+                "share a server with the bot yet (even when their DMs are open). Their "
+                "verification DM has been queued and will also send automatically as soon "
+                "as they run any command with the app."
+            )
+        return False, (
+            "Discord blocked the DM (error 50007: direct messages from server members "
+            "are disabled for this server, or the bot is blocked). Their verification "
+            "DM has been queued for their next interaction."
+        )
+    return False, f"Discord could not deliver the DM ({last_exc or 'unknown error'})."
+
+
+async def _deliver_pending_whitelist_dm(user_obj):
+    """Send a queued verification DM when a whitelisted user interacts with the bot."""
+    uid = getattr(user_obj, "id", None)
+    if uid is None:
+        return
+    pending = _read_pending_whitelist_dms()
+    if uid not in pending:
+        return
+    try:
+        create_dm = getattr(user_obj, "create_dm", None)
+        if callable(create_dm):
+            dm = await create_dm()
+            await dm.send(embed=_whitelist_dm_embed())
+        else:
+            await user_obj.send(embed=_whitelist_dm_embed())
+        allow = _read_staff_whitelist()
+        pending.discard(uid)
+        _write_staff_whitelist(allow, pending)
+        _log(f"delivered queued whitelist verification DM to user id {uid}")
+    except Exception as exc:  # noqa: BLE001
+        _log(f"queued whitelist DM still blocked for {uid}: {exc}")
+
+
 @bot.tree.command(
     name="whitelist",
     description="Manage the extra staff allow-list (owner only).",
@@ -2538,37 +2964,28 @@ async def whitelist_slash(interaction: discord.Interaction,
                           user_id: str = None):
     if not await _require_owner(interaction):
         return
-    # Ack the interaction up front so the token can't expire before the reply.
-    # Some invocations 404 "Unknown interaction" (10062) when the first response
-    # lands late or the interaction is touching a file on a slow disk; deferring
-    # first and replying via followup (same as the other commands) avoids it.
-    # The response is public so the add/remove confirmations are visible to the
-    # whole channel (only the "list" view below stays owner-only/ephemeral).
-    await interaction.response.defer(thinking=True, ephemeral=False)
     action = (action or "").strip().lower()
+    is_list = (action == "list")
+    await interaction.response.defer(thinking=True, ephemeral=is_list)
     allow = _read_staff_whitelist()
+    pending_dms = _read_pending_whitelist_dms()
 
     # /whitelist list — management view, only the requester sees it.
-    if action == "list":
+    if is_list:
         entries = []
         for uid in sorted(allow):
-            name = None
-            try:
-                u = await interaction.client.fetch_user(uid)
-                name = u.display_name
-            except Exception:
-                name = None
-            label = f"**{name}** — `{uid}`" if name else f"`{uid}`"
-            entries.append(label)
+            resolved = None
+            _, resolved, _ = await _resolve_whitelist_target(interaction, None, str(uid))
+            entries.append(_whitelist_user_label(uid, resolved))
         embed = discord.Embed(
             title="Staff Allow-List",
             description=(
-            f"{len(allow)} user(s) verified and able to use this bot as an app."
-        ) if allow else "No users verified yet.",
+                f"{len(allow)} user(s) verified and able to use this bot as an app."
+            ) if allow else "No users verified yet.",
             color=PURPLE,
         )
         if entries:
-            embed.add_field(name="Whitelisted", value="\n".join(entries),
+            embed.add_field(name="Whitelisted", value="\n".join(entries)[:1024],
                             inline=False)
         _advertise_fields(embed)
         _brand_footer(embed, "staff whitelist")
@@ -2587,7 +3004,6 @@ async def whitelist_slash(interaction: discord.Interaction,
         await interaction.followup.send(embed=embed, ephemeral=True)
         return
     if uid is None:
-        # add/remove needs a target; give a clear prompt instead of guessing.
         embed = discord.Embed(
             title="Pick a user",
             description=(
@@ -2602,7 +3018,10 @@ async def whitelist_slash(interaction: discord.Interaction,
         _brand_footer(embed, "staff whitelist")
         await interaction.followup.send(embed=embed, ephemeral=True)
         return
-    label = target.mention if target is not None else f"`{uid}`"
+
+    mention_tag = f"<@{uid}>"
+    label = _whitelist_user_label(uid, target)
+    mention_allow = discord.AllowedMentions(users=True, roles=False, everyone=False)
 
     if action == "add":
         if target is None:
@@ -2617,63 +3036,73 @@ async def whitelist_slash(interaction: discord.Interaction,
             _brand_footer(embed, "staff whitelist")
             await interaction.followup.send(embed=embed, ephemeral=True)
             return
-        if uid in allow:
+
+        already_in = uid in allow
+        allow.add(uid)
+        _write_staff_whitelist(allow, pending_dms)
+
+        if already_in:
             embed = discord.Embed(
                 title="Already Whitelisted",
-                description=f"{label} is already on the staff allow-list.",
+                description=(
+                    f"{label} is already on the staff allow-list. "
+                    "Re-sending their verification DM now."
+                ),
                 color=PURPLE,
             )
-            _advertise_fields(embed)
-            _brand_footer(embed, "staff whitelist")
-            await interaction.followup.send(embed=embed, ephemeral=False)
-            return
-        allow.add(uid)
-        _write_staff_whitelist(allow)
-        embed = discord.Embed(
-            title="User Whitelisted",
-            description=(
-                f"{label} has been verified and can now use **KILLA'S BOSS** "
-                "as an app on their user account."
-            ),
-            color=GREEN,
-        )
-        embed.add_field(name="Status", value="Verified", inline=True)
-        embed.add_field(name="Added by",
-                        value=interaction.user.display_name, inline=True)
-        embed.add_field(
-            name="Use it as an app",
-            value=(
-                f"{label} can now run this bot as an app on their user "
-                "account — add it under Discord → User Settings → Apps, then use "
-                "the slash commands in a DM with the bot or in their own server."
-            ),
-            inline=False,
-        )
+        else:
+            embed = discord.Embed(
+                title="User Whitelisted",
+                description=(
+                    f"{label} has been verified and can now use **KILLA'S BOSS** "
+                    "as an app on their Discord account."
+                ),
+                color=GREEN,
+            )
+            embed.add_field(name="Status", value="Verified", inline=True)
+            embed.add_field(name="Added by",
+                            value=interaction.user.display_name, inline=True)
+            embed.add_field(
+                name="Use it as an app",
+                value=(
+                    f"{mention_tag} can add this bot under Discord -> User Settings -> Apps, "
+                    "then run slash commands in a DM with the bot or in their own server."
+                ),
+                inline=False,
+            )
         _advertise_fields(embed)
         _brand_footer(embed, "staff whitelist")
-        await interaction.followup.send(embed=embed, ephemeral=False)
-        # Tell the whitelisted user directly, and report whether it landed so the
-        # person (and anyone watching) can see they've been whitelisted even when
-        # their DMs are closed.
-        try:
-            await target.send(embed=_whitelist_dm_embed())
-            dm_ok = True
-        except discord.Forbidden:
-            dm_ok = False
-        except Exception:
-            dm_ok = False
+        # Include `content=mention_tag` so Discord populates `message.mentions`
+        # and renders `<@uid>` as a real clickable user tag even for uncached `user_id` users!
+        await interaction.followup.send(
+            content=mention_tag,
+            embed=embed,
+            allowed_mentions=mention_allow,
+            ephemeral=False,
+        )
+
+        dm_ok, dm_detail = await _send_whitelist_dm(interaction, uid, target)
+        if dm_ok:
+            pending_dms.discard(uid)
+        else:
+            pending_dms.add(uid)
+        _write_staff_whitelist(allow, pending_dms)
+
         note = discord.Embed(
-            title="Notification sent",
+            title="Notification sent" if dm_ok else "Verification DM queued",
             description=(
-                f"{label} has been DM'd that they're whitelisted."
+                f"{label} has been DM'd that they're verified."
                 if dm_ok else
-                f"{label} couldn't be DM'd (private messages are likely "
-                "closed) — they were shown in the confirmation above instead."
+                f"{label} could not be DM'd right now: {dm_detail}"
             ),
             color=GREEN if dm_ok else PURPLE,
         )
         _brand_footer(note, "staff whitelist")
-        await interaction.followup.send(embed=note, ephemeral=False)
+        await interaction.followup.send(
+            embed=note,
+            allowed_mentions=discord.AllowedMentions.none(),
+            ephemeral=False,
+        )
         return
 
     if action == "remove":
@@ -2685,15 +3114,19 @@ async def whitelist_slash(interaction: discord.Interaction,
             )
             _advertise_fields(embed)
             _brand_footer(embed, "staff whitelist")
-            await interaction.followup.send(embed=embed, ephemeral=False)
+            await interaction.followup.send(
+                content=mention_tag,
+                embed=embed,
+                allowed_mentions=mention_allow,
+                ephemeral=False,
+            )
             return
         allow.discard(uid)
-        _write_staff_whitelist(allow)
+        pending_dms.discard(uid)
+        _write_staff_whitelist(allow, pending_dms)
         embed = discord.Embed(
             title="User Removed From Whitelist",
-            description=(
-                f"{label} has been removed from the verified list."
-            ),
+            description=f"{label} has been removed from the verified list.",
             color=RED,
         )
         embed.add_field(name="Status", value="Access revoked", inline=True)
@@ -2701,7 +3134,12 @@ async def whitelist_slash(interaction: discord.Interaction,
                         value=interaction.user.display_name, inline=True)
         _advertise_fields(embed)
         _brand_footer(embed, "staff whitelist")
-        await interaction.followup.send(embed=embed, ephemeral=False)
+        await interaction.followup.send(
+            content=mention_tag,
+            embed=embed,
+            allowed_mentions=mention_allow,
+            ephemeral=False,
+        )
         return
 
     # Unknown action.
@@ -2751,7 +3189,10 @@ async def on_interaction(interaction):
                 v = json.dumps(v, default=str)
             opts.append(f"{o['name']}={v}")
     opt_txt = (" " + " ".join(opts)) if opts else ""
-    _log(f"user {interaction.user} (id {interaction.user.id}) used /{cmd.name}{opt_txt}")
+    cmd_label = getattr(cmd, "qualified_name", None) or cmd.name
+    _log(f"user {interaction.user} (id {interaction.user.id}) used /{cmd_label}{opt_txt}")
+    if getattr(interaction, "user", None) is not None:
+        asyncio.create_task(_deliver_pending_whitelist_dm(interaction.user))
 
 
 def _cleanup_stale_workdirs(max_age=24 * 3600):

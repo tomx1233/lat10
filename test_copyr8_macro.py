@@ -48,20 +48,32 @@ class BundledMacroTests(unittest.TestCase):
 
     def test_v4_exact_step_order_and_settings(self):
         steps = parse_macro(processor.BUNDLED_V4_MACRO)
-        self.assertEqual([name for name, _ in steps], [
-            "SelectAll", "StereoToMono", "Duplicate",
-            "SelectTracks", "PanRight", "SelectTracks", "PanLeft",
-            "SelectTracks", "Tremolo", "SelectTracks", "Tremolo",
-            "SelectAll", "MixAndRender", "SelectAll", "Sc1", "SelectAll", "Sc1",
+        names = [name for name, _ in steps]
+        self.assertEqual(names, [
+            "SelectAll",
+            "ClipFix",
+            "Phaser",
+            "Reverb",
+            "NotchFilter",
+            "NotchFilter",
+            "NotchFilter",
+            "NotchFilter",
+            "BassAndTreble",
+            "Compressor",
+            "Limiter",
         ])
-        self.assertEqual([params for name, params in steps if name == "Tremolo"], [
-            'lfo="4" phase="60" wave="Sine" wet="50"',
-            'lfo="4" phase="0" wave="Sine" wet="40"',
-        ])
+        self.assertNotIn("StereoToMono", names)
+        self.assertNotIn("Tremolo", names)
+        self.assertNotIn("Sc1", names)
         self.assertEqual(
-            [params for name, params in steps if name == "Sc1"],
-            ['Attack_time_(ms)="400" Knee_radius_(dB)="2" Makeup_gain_(dB)="5" '
-             'Ratio_(1_n)="10" Release_time_(ms)="800" Threshold_level_(dB)="-15"'] * 2)
+            [params for name, params in steps if name == "NotchFilter"],
+            [
+                'frequency="2550" q="10"',
+                'frequency="5050" q="10"',
+                'frequency="8500" q="10"',
+                'frequency="12950" q="10"',
+            ],
+        )
 
     def test_v4_install_is_exact_and_idempotent(self):
         with tempfile.TemporaryDirectory() as tmp, patch.object(processor, "MACRO_DIR", tmp):
@@ -85,7 +97,7 @@ class BundledMacroTests(unittest.TestCase):
                 result = processor.run_macro_blocking(
                     "input.wav", str(output), str(processor.BUNDLED_V4_MACRO))
                 drop.assert_called_once_with()
-                self.assertEqual(len(result["steps"]), 17)
+                self.assertEqual(len(result["steps"]), 11)
                 self.assertTrue(result["metadata"])
                 session.apply_macro_to_file.assert_called_once_with(
                     "input.wav", str(output), parse_macro(processor.BUNDLED_V4_MACRO),

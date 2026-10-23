@@ -154,14 +154,15 @@ def _header(headers, name):
     return None
 
 
-def _require_config():
-    if not ROBLOX_COOKIE:
+def _require_config(cookie=None):
+    effective_cookie = ROBLOX_COOKIE if cookie is None else cookie
+    if not effective_cookie:
         raise GrantError("ROBLOX_COOKIE isn't set in .env -- the grant account "
                          "(.ROBLOSECURITY=...; rbxas=...) is required for both the "
                          "asset lookup and the grant.")
-    if not SUPPORTED_GROUP_IDS:
-        raise GrantError("SUPPORTED_GROUP_IDS isn't set in .env -- at least one "
-                         "group id the bot is allowed to grant from is required.")
+    if not supported_groups():
+        raise GrantError("No supported groups are configured -- set SUPPORTED_GROUP_IDS "
+                         "in .env or add a group with /verifygroup add.")
 
 
 def get_csrf_token(cookie=ROBLOX_COOKIE):
@@ -656,7 +657,7 @@ def verify_group(group_id: int):
 def grant_permission(asset_id: int, universe_id: int = None, cookie=ROBLOX_COOKIE):
     """Validate the audio, then add universe_id to its permission list.
     Returns a dict describing the grant. Raises GrantError on any failure."""
-    _require_config()
+    _require_config(cookie=cookie)
     if universe_id is None:
         universe_id = GRANT_UNIVERSE_ID
 
@@ -708,7 +709,7 @@ def verify(asset_id: int, universe_id: int = None, cookie=ROBLOX_COOKIE):
     (no permission is needed); a group-owned audio from a supported group is
     granted right here.
     """
-    _require_config()
+    _require_config(cookie=cookie)
     if universe_id is None:
         universe_id = GRANT_UNIVERSE_ID
 

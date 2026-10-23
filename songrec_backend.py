@@ -8,6 +8,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import threading
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -53,9 +54,9 @@ def resolve_songrec():
     candidates = [
         BUNDLED_SONGREC,
         os.path.join(tools_dir, "songrec.exe"),
-        os.path.join(tools_dir, "songrec.bat"),
-        os.path.join(tools_dir, "songrec"),
         os.path.join(tools_dir, "songrec.py"),
+        os.path.join(tools_dir, "songrec"),
+        os.path.join(tools_dir, "songrec.bat"),
     ]
     for c in candidates:
         found = shutil.which(c) or (c if os.path.isfile(c) else None)
@@ -96,7 +97,16 @@ def run_songrec(path, executable=None, timeout=60):
     if not os.path.isfile(abspath):
         raise ValueError("File does not exist")
 
-    prefix = [sys.executable, executable] if executable.endswith(".py") else [executable]
+    is_py_script = executable.endswith(".py")
+    if not is_py_script and os.path.isfile(executable):
+        try:
+            with open(executable, "rb") as fh:
+                head = fh.read(64)
+            if head.startswith(b"#!") and b"python" in head.lower():
+                is_py_script = True
+        except OSError:
+            pass
+    prefix = [sys.executable, executable] if is_py_script else [executable]
 
     subcommands = [
         prefix + ["audio-file-to-recognized-song", abspath],
@@ -114,7 +124,7 @@ def run_songrec(path, executable=None, timeout=60):
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0,
             )
             stdout = res.stdout.strip() if res.stdout else ""
-            if res.returncode == 0 or stdout:
+            if res.returncode == 0 and stdout:
                 return res.returncode, stdout, res.stderr or ""
         except (OSError, subprocess.TimeoutExpired):
             continue
@@ -137,7 +147,7 @@ def parse_response(stdout_or_data):
     elif isinstance(stdout_or_data, str):
         text = stdout_or_data.strip()
         if not text:
-            return 0, {"matched": False}
+            return None, {"matched": False}
         try:
             data = json.loads(text)
         except json.JSONDecodeError:
@@ -155,7 +165,7 @@ def parse_response(stdout_or_data):
                 }
             return None, {"matched": False}
 
-    if not isinstance(data, dict):
+    if not isinstance(data, dict) or data.get("error"):
         return None, {"matched": False}
 
     track = data.get("track")
