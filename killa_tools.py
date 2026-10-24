@@ -667,8 +667,15 @@ def copyr8_process(input_path, output_path, spectrogram_path, preset_name="balan
 UNVERIFIED_PROTECTION = COPYR8_PRESETS["balanced"]   # (+2.00 st, 1.07x)
 
 
-def _protection_cost():
-    pitch, tempo = UNVERIFIED_PROTECTION
+# V4 has its own slower-only policy. Never send it through the legacy
+# +2 st / 1.07x fallback, including when the original is unknown to the APIs.
+V4_UNVERIFIED_SHIFT = (0.0, 0.94)
+V4_PITCH_STEPS = (0.0, -0.05, -0.10, -0.15, -0.20)
+V4_TEMPO_STEPS = tuple(round(1.0 - percent / 100.0, 2) for percent in range(1, 17))
+
+
+def _protection_cost(shift=None):
+    pitch, tempo = UNVERIFIED_PROTECTION if shift is None else shift
     return round(abs(pitch) + 10.0 * abs(tempo - 1.0), 2)
 
 
@@ -1333,7 +1340,8 @@ def _mildest_rungs():
 
 def find_mildest(input_path, output_path, progress=None,
                  use_tremolo=True, overlay_tremolo=None,
-                 rungs=None, control_path=None):
+                 rungs=None, control_path=None, *, unverified_shift=None,
+                 search_order="closest-sounding first"):
     """Auto-Fit V2: search for the CLOSEST-SOUNDING shift the recogniser can't ID.
 
     The previous version's "Auto-Fit V2": it starts at almost no change and
@@ -1361,12 +1369,17 @@ def find_mildest(input_path, output_path, progress=None,
         kept -- whether a wobble breaks a working setting is a property of the
         track, so it is verified rather than assumed.
 
+    Caller-supplied `rungs` are tried in their given order. V4 supplies a
+    pitch-first, slower-only stream and its own `unverified_shift`; other fits
+    retain the existing balanced fallback. `search_order` describes that order
+    in progress messages without changing the API checks.
+
     Returns {"pitch", "tempo", "cost", "counts", "overlay_applied",
              "overlay_reason", "verified", "info"} where clean is counts not
     None, `cost` is the deviation from the original in semitone-equivalents
     (lower = sounds closer; it includes the wobble when one was applied), and
     `verified`: True = confirmed against the recogniser, False = neither
-    service knows the original (the balanced protection shift is applied and
+    service knows the original (the configured fallback shift is applied and
     the tremolo overlay pass is skipped), None = not attempted/inconclusive.
     """
     if not os.path.isfile(input_path):
@@ -1382,8 +1395,11 @@ def find_mildest(input_path, output_path, progress=None,
 
     if rungs is None:
         rungs = _mildest_rungs()
+    fallback_shift = UNVERIFIED_PROTECTION if unverified_shift is None else unverified_shift
+    fallback_label = ("balanced protection shift" if unverified_shift is None
+                      else "configured fallback shift")
     if progress:
-        progress(f"searching {len(rungs)} settings, closest-sounding first...")
+        progress(f"searching {len(rungs)} settings, {search_order}...")
 
     workdir = os.path.dirname(output_path) or "."
     work_wav = os.path.join(workdir, "autofit_v2_candidate.wav")
@@ -1395,10 +1411,10 @@ def find_mildest(input_path, output_path, progress=None,
             if progress:
                 pct = (tempo - 1.0) * 100.0
                 if depth:
-                    progress("testing %+.1f st / +%.1f%% + tremolo "
+                    progress("testing %+.2f st / %+.1f%% + tremolo "
                              "%.2f@%gHz..." % (pitch, pct, depth, rate))
                 else:
-                    progress("testing %+.1f st / +%.1f%%..." % (pitch, pct))
+                    progress("testing %+.2f st / %+.1f%%..." % (pitch, pct))
 
             # Gap-free whole-song probe sweep on the candidate -- cut straight
             # from the input with the shift (and wobble) filters applied, so a
@@ -1418,13 +1434,14 @@ def find_mildest(input_path, output_path, progress=None,
             if control is False:
                 # Neither database knows the track: every rung sweeps clean
                 # trivially, so the mildest rung would ship an effectively
-                # unprotected copy. Apply the balanced protection shift.
-                p_pitch, p_tempo = UNVERIFIED_PROTECTION
+                # unprotected copy. Keep the caller's fallback policy (V4 must
+                # stay slower-only with minimal pitch, even in this branch).
+                p_pitch, p_tempo = fallback_shift
                 if progress:
                     progress("control failed: neither recogniser knows the "
-                             "original -- applying the balanced protection shift "
+                             f"original -- applying the {fallback_label} "
                              f"({p_pitch:+.2f} st / {p_tempo:.2f}x), unverified")
-                winner = (_protection_cost(), p_pitch, p_tempo, winner[3],
+                winner = (_protection_cost(fallback_shift), p_pitch, p_tempo, winner[3],
                           winner[4], 0.0, 0.0)
                 verified = False
             elif control is True:
@@ -1476,7 +1493,7 @@ def find_mildest(input_path, output_path, progress=None,
                                         key=lambda x: x[0]):
                 if progress:
                     pct = (tempo - 1.0) * 100.0
-                    progress("adding tremolo %+.1f st / +%.1f%% + tremolo "
+                    progress("adding tremolo %+.2f st / %+.1f%% + tremolo "
                              "%.2f@%gHz on top of the accepted setting..." % (
                                  pitch, pct, odepth, orate))
                 trem_wav = work_wav + ".trem.wav"
@@ -1717,6 +1734,21 @@ def _v3_adjust_rungs():
     return out + _mixed_v3_rungs()
 
 
+def _v4_adjust_rungs():
+    """V4: try every zero-pitch slowdown before tiny downward pitch steps.
+
+    At each pitch tier, walk 1%..16% slower, least slowdown first. Only after
+    the entire zero-pitch tier fails do -0.05, -0.10, -0.15 and -0.20 st get a
+    turn. No V3 presets, speed-ups or extra tremolo can enter this stream.
+    Cost remains the reported deviation, not a re-sort across pitch tiers.
+    """
+    return [
+        (_protection_cost((pitch, tempo)), pitch, tempo, 0.0, 0.0)
+        for pitch in V4_PITCH_STEPS
+        for tempo in V4_TEMPO_STEPS
+    ]
+
+
 def _mixed_v3_rungs():
     """V3's candidate pool: Auto-Fit's fixed ladder mixed into V2's walk.
 
@@ -1787,6 +1819,9 @@ def copyr8_autofit_v4(input_path, output_path, spectrogram_path, progress=None,
     that macro, static zero-phase EQ changes the actual spectrum before probes
     and on export. The added layer generates no high-pitched tones or sweeps;
     it does not replace the macro's effects or stack another tremolo overlay.
+    Search unchanged pitch with progressively slower tempos first; only then
+    try tiny downward pitch nudges (at most 0.20 st). V4 never speeds up, even
+    for unverified or best-effort fallback exports.
     """
     return _copyr8_autofit_macro_search(
         input_path, output_path, spectrogram_path, progress=progress,
@@ -1808,6 +1843,8 @@ def _copyr8_autofit_macro_search(input_path, output_path, spectrogram_path,
     songrec_backend.validate_setup(required=False)
 
     is_v4 = (tag == "v4")
+    fallback_shift = V4_UNVERIFIED_SHIFT if is_v4 else UNVERIFIED_PROTECTION
+    fallback_label = "slow-tempo fallback" if is_v4 else "balanced protection shift"
     workdir = os.path.dirname(output_path) or "."
     work_wav = os.path.join(workdir, f"autofit_{tag}_work.wav")
     base_wav = os.path.join(workdir, f"autofit_{tag}_base.wav")
@@ -1877,11 +1914,11 @@ def _copyr8_autofit_macro_search(input_path, output_path, spectrogram_path,
             p_pitch, p_tempo, p_cost = 0.0, 1.0, 0.0
             final_wav = base_path
             if verified is False:
-                p_pitch, p_tempo = UNVERIFIED_PROTECTION
-                p_cost = _protection_cost()
+                p_pitch, p_tempo = fallback_shift
+                p_cost = _protection_cost(fallback_shift)
                 if progress:
                     progress("control failed: neither service knows the original "
-                             "-- applying the balanced protection shift "
+                             f"-- applying the {fallback_label} "
                              f"({p_pitch:+.2f} st / {p_tempo:.2f}x) on top of the "
                              "macro output, unverified")
                 _render_shifted_wav(base_path, work_wav, p_pitch, p_tempo)
@@ -1898,18 +1935,27 @@ def _copyr8_autofit_macro_search(input_path, output_path, spectrogram_path,
                       "info": {"pitch": p_pitch, "tempo": p_tempo,
                                "level_gain_db": 0.0}}
         else:
-            rungs = ([r for r in _v3_adjust_rungs() if not r[3]]
-                     if is_v4 else _v3_adjust_rungs())
+            rungs = _v4_adjust_rungs() if is_v4 else _v3_adjust_rungs()
             if progress:
-                progress("the filter still detects the base; adding preset "
-                         f"adjustments ({len(rungs)} settings), mildest first, "
-                         "testing each one against the API...")
+                if is_v4:
+                    progress("trying slower tempos with unchanged pitch first "
+                             f"({len(rungs)} settings; pitch nudges capped at -0.20 st, "
+                             "no speed-ups), testing each one against the API...")
+                else:
+                    progress("the filter still detects the base; adding preset "
+                             f"adjustments ({len(rungs)} settings), mildest first, "
+                             "testing each one against the API...")
+            search_options = ({
+                "unverified_shift": V4_UNVERIFIED_SHIFT,
+                "search_order": "unchanged pitch first, slower tempos only",
+            } if is_v4 else {})
             result = find_mildest(
                 base_path, work_wav, progress=progress,
                 use_tremolo=(not is_v4),
                 overlay_tremolo=(None if is_v4 else AUTOFIT_V2_TREMOLO),
                 rungs=rungs,
                 control_path=input_path,
+                **search_options,
             )
             final_wav = work_wav
 
@@ -1935,7 +1981,7 @@ def _copyr8_autofit_macro_search(input_path, output_path, spectrogram_path,
         _brand_spectrogram(spectrogram_path)
 
         if progress:
-            progress(f"done: used {pitch:+.1f} st / tempo {tempo:.2f}x"
+            progress(f"done: used {pitch:+.2f} st / tempo {tempo:.2f}x"
                      + (f" + tremolo {tremolo_depth:.2f}@{tremolo_rate:g}Hz"
                         if tremolo_applied else "")
                      + (f", level {loudness['out_lufs']:.1f} LUFS vs source "
@@ -1945,8 +1991,7 @@ def _copyr8_autofit_macro_search(input_path, output_path, spectrogram_path,
                      + (""
                         if verified is None else
                         ", confirmed against the recogniser" if verified else
-                        ", unverified (neither service knows the original; balanced "
-                    "protection applied)"))
+                        f", unverified (neither service knows the original; {fallback_label} applied)"))
         return {
             "pitch": pitch,
             "tempo": tempo,

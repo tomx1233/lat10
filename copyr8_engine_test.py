@@ -242,7 +242,7 @@ assert res["overlay_applied"] is False
 assert res["overlay_reason"] == ("the tremolo version was still recognised -- "
                                  "keeping the pure shift")
 assert "searching" in log2[0] and "closest-sounding first" in log2[0]
-assert "testing -0.1 st / +5.0%..." in log2[1], log2[1]
+assert "testing -0.10 st / +5.0%..." in log2[1], log2[1]
 costs = [c for _p, _t, c in state2["order"]]
 assert costs == sorted(costs), costs
 print("10. find_mildest mildest-first OK: cost", res["cost"],
@@ -499,8 +499,10 @@ res = kt.copyr8_autofit_v4(src, mp34, spec4, progress=log4.append, macro_fn=None
 assert res["macro"]["applied"] is False
 assert res["macro"]["reason"].startswith("no macro configured")
 assert "COPYR8_V4_MACRO" in res["macro"]["reason"], res["macro"]["reason"]
-assert (res["pitch"], res["tempo"]) == (-1.0, 1.30)
-print("24. copyr8_autofit_v4 no-macro fallback OK: escalates to (-1.0/1.30)")
+assert (res["pitch"], res["tempo"]) == (-0.20, 0.84)
+assert res["clean"] is False
+assert abs(sf.info(mp34).duration - sf.info(src).duration / 0.84) < 0.12
+print("24. copyr8_autofit_v4 no-macro fallback OK: stays slower-only (-0.20/0.84)")
 
 print()
 print("ALL ENGINE TESTS PASSED")

@@ -23,7 +23,7 @@ DMs, other servers, any channel. The owner can always run everything:
                                 Auto-Fit V2 = closest-sounding search, mildest first, with tremolo test.
                                 Auto-Fit V3 = bundled macro chain + mixed search that
                                               reuses both playbooks until it's unreadable.
-                                Auto-Fit V4 = original macro + spectral add-on + V3's mixed search.
+                                Auto-Fit V4 = original macro + spectral add-on + slower-tempo, minimal-pitch search.
                                 Subtle / Balanced / Stealth / Aggressive = fixed key/speed shifts.
   /lookup <file>              -- identify a song with Shazam: title, artist, album,
                                  release, cover art, and a link to the Shazam page.
@@ -2292,10 +2292,11 @@ async def copyr8_slash(interaction: discord.Interaction,
                        "the original. This is a recognition check, not a copyright "
                        "or moderation guarantee.")
         elif result.get("verified") is False:
+            fallback_label = "slow-tempo fallback" if is_v4 else "balanced protection shift"
             verdict = (f"None of {apis_list} identified the original, "
-                       "so a clean result proves nothing. The balanced "
-                       "protection shift (+2.00 st / 1.07x) was applied instead "
-                       "of a trivial one. The result is unverified.")
+                       f"so a clean result proves nothing. The {fallback_label} "
+                       f"({result['pitch']:+.2f} st / {result['tempo']:.2f}x) was applied "
+                       "instead of a trivial one. The result is unverified.")
         else:
             verdict = ("The candidate returned no matches, but an original-file "
                        "control check was inconclusive. The result is unverified.")
@@ -2314,7 +2315,13 @@ async def copyr8_slash(interaction: discord.Interaction,
         # The walk only accepts a tempo past the cap once every same-speed
         # split failed, so when that happens the reply says why instead of
         # letting "1.17x" read like a normal result.
-        if result["tempo"] > 1.081:
+        if is_v4 and result["tempo"] < 1.0:
+            embed.add_field(
+                name="Speed",
+                value=(f"{(1.0 - result['tempo']) * 100:.0f}% slower than the input. "
+                       "V4 prioritizes unchanged pitch before tiny pitch nudges."),
+                inline=False)
+        elif result["tempo"] > 1.081:
             embed.add_field(
                 name="Speed",
                 value=("this one runs faster than the original: the track "

@@ -56,12 +56,36 @@ no synthesized high-frequency ribbons or added flanger/phaser/vibrato sweeps.
 The original macro's intentional 4 Hz tremolo **is preserved**; the search does
 not stack another tremolo overlay on top of it.
 
+### V4 slower-tempo / minimal-pitch search
+
+The original 17-step macro and spectral layer are unchanged. Only V4's
+additional pitch/tempo search uses the slower approach:
+
+- If the macro plus spectral layer already passes and the original is known,
+  keep `0.00 st / 1.00x` (no unnecessary pitch or tempo shift).
+- Otherwise try **unchanged pitch first**, testing `0.99x` down to `0.84x` in
+  `0.01` steps (1% to 16% slower, least slowdown first).
+- Only after all unchanged-pitch slowdowns fail, try tiny downward pitch
+  nudges: `-0.05`, `-0.10`, `-0.15`, then `-0.20 st`, with that same slower
+  tempo range. No V4 search candidate is faster than the input.
+- If no service knows the original, use the explicitly unverified
+  `0.00 st / 0.94x` fallback, **not** the old `+2.00 st / 1.07x` preset.
+- If every candidate remains recognized, the best-effort fallback stays
+  inside V4's slow/minimal-pitch bounds (`-0.20 st / 0.84x`); it is not marked
+  clean. If no service gives a usable answer, no file is exported.
+
+Pitch and tempo are processed independently so slowing the tempo does not
+also lower the key. Every candidate still uses the existing gap-free probe
+windows and API pacing. Auto-Fit V1/V2/V3 and the fixed presets keep their
+existing search/preset behavior.
+
 ## Scope and defaults
 
 Only **`/copyr8` -> `Auto-Fit V3 (macro + mixed)`** uses the V3 file, and only
 **`/copyr8` -> `Auto-Fit V4 (new macro)`** uses the V4 file. Both macros run
-before their shared shift search; V4 additionally processes the macro output
-with its spectral layer. V3 and the other presets are unchanged.
+before their respective searches; V4 additionally processes the macro output
+with its spectral layer and uses the slower-only profile above. V3 and the
+other presets are unchanged.
 
 No `.env` change is required: an unset or blank `COPYR8_V3_MACRO` /
 `COPYR8_V4_MACRO` selects the bundled chain. A non-empty override still wins
@@ -89,7 +113,7 @@ The Audacity integration targets **Audacity 2.3.3 on Windows**:
 
 ## Tests
 
-Run `python -m unittest -v test_copyr8_macro test_v4_audio` from the repository
+Run `python -m unittest -v test_copyr8_macro test_v4_audio test_v4_tempo` from the repository
 root. Macro tests lock all 17 original V4 commands and parameters and verify
 that the restored file is installed before Audacity runs. Signal tests cover
 the **additional spectral layer**: actual spectral cuts, no added whine/sweeps,
